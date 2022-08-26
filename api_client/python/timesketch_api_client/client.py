@@ -626,7 +626,7 @@ class TimesketchApi:
         return sigma_obj
 
     def list_sigmarule_rules(self, as_pandas=False):
-        """Get a list of sigma objects.
+        """NEW: Get a list of sigma objects.
 
         Args:
             as_pandas: Boolean indicating that the results will be returned
@@ -659,7 +659,7 @@ class TimesketchApi:
         return rules
 
     def get_sigmarule_rule(self, rule_uuid):
-        """Get a sigma rule.
+        """NEW: Get a sigma rule.
 
         Args:
             rule_uuid: UUID of the Sigma rule.
@@ -673,7 +673,7 @@ class TimesketchApi:
         return sigma_obj
 
     def get_sigmarule_rule_by_text(self, rule_text):
-        """Returns a Sigma Object based on a sigma rule text.
+        """NEW: Returns a Sigma Object based on a sigma rule text.
 
         Args:
             rule_text: Full Sigma rule text.
@@ -687,7 +687,6 @@ class TimesketchApi:
         if not rule_text:
             raise ValueError("No rule text given.")
 
-        breakpoint()
         try:
             sigma_obj = sigma.SigmaRule(api=self)
             sigma_obj.from_text(rule_text)

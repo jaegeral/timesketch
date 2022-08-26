@@ -313,6 +313,91 @@ def mock_response(*args, **kwargs):
         ],
     }
 
+    sigmarule_list = {
+        "meta": {"current_user": "dev", "rules_count": 2},
+        "objects": [
+            {
+                "author": "Alexander Jaeger",
+                "date": "2020/06/26",
+                "description": "Detects suspicious installation of ZMap",
+                "detection": {
+                    "condition": "keywords",
+                    "keywords": ["*apt-get install zmap*"],
+                },
+                "falsepositives": ["Unknown"],
+                "id": "5266a592-b793-11ea-b3de-0242ac130004",
+                "level": "high",
+                "logsource": {"product": "linux", "service": "shell"},
+                "query_string": '("*apt\\-get\\ install\\ zmap*")',
+                "modified": "2020/06/26",
+                "references": ["httpx://foobar.com"],
+                "title": "Suspicious Installation of ZMap",
+            },
+            {
+                "author": "Alexander Jaeger",
+                "date": "2020/11/10",
+                "description": "Detects suspicious installation of foobar",
+                "detection": {
+                    "condition": "keywords",
+                    "keywords": ["*apt-get install foobar*"],
+                },
+                "falsepositives": ["Unknown"],
+                "id": "776bdd11-f3aa-436e-9d03-9d6159e9814e",
+                "level": "high",
+                "logsource": {"product": "linux", "service": "shell"},
+                "query_string": '("*apt\\-get\\ install\\ foo*")',
+                "modified": "2020/06/26",
+                "references": ["httpx://foobar.com"],
+                "title": "Suspicious Installation of ZMap",
+            },
+        ],
+    }
+
+    sigmarule_rule = {
+        "meta": {"parsed": True},
+        "objects": [
+            {
+                "title": "Suspicious Installation of ZMap",
+                "id": "5266a592-b793-11ea-b3de-0242ac130004",
+                "description": "Detects suspicious installation of ZMap",
+                "references": ["httpx://foobar.com"],
+                "author": "Alexander Jaeger",
+                "date": "2020/06/26",
+                "modified": "2021/01/01",
+                "logsource": {"product": "linux", "service": "shell"},
+                "detection": {
+                    "keywords": ["*apt-get install zmap*"],
+                    "condition": "keywords",
+                },
+                "falsepositives": ["Unknown"],
+                "level": "high",
+                "query_string": '("*apt\\-get\\ install\\ zmap*")',
+            }
+        ],
+    }
+    sigmarule_rule_text_mock = {
+        "meta": {"parsed": True},
+        "objects": [
+            {
+                "title": "Installation of foobar",
+                "id": "bb1e0d1d-cd13-4b65-bf7e-69b4e740266b",
+                "description": "Detects suspicious installation of foobar",
+                "references": ["https://samle.com/foobar"],
+                "author": "Alexander Jaeger",
+                "date": "2020/12/10",
+                "modified": "2021/01/01",
+                "logsource": {"product": "linux", "service": "shell"},
+                "detection": {
+                    "keywords": ["*apt-get install foobar*"],
+                    "condition": "keywords",
+                },
+                "falsepositives": ["Unknown"],
+                "level": "high",
+                "query_string": '(data_type:("shell\\:zsh\\:history" OR "bash\\:history\\:command" OR "apt\\:history\\:line" OR "selinux\\:line") AND "*apt\\-get\\ install\\ foobar*")',  # pylint: disable=line-too-long
+            }
+        ],
+    }
+
     # Register API endpoints to the correct mock response data.
     url_router = {
         "http://127.0.0.1": MockResponse(text_data=auth_text_data),
@@ -351,6 +436,13 @@ def mock_response(*args, **kwargs):
         "http://127.0.0.1/api/v1/sigma/": MockResponse(json_data=sigma_list),
         "http://127.0.0.1/api/v1/sigma/text/": MockResponse(
             json_data=sigma_rule_text_mock
+        ),
+        "http://127.0.0.1/api/v1/sigmarule/rule/5266a592-b793-11ea-b3de-0242ac130004": MockResponse(  # pylint: disable=line-too-long
+            json_data=sigmarule_rule
+        ),
+        "http://127.0.0.1/api/v1/sigmarule/": MockResponse(json_data=sigmarule_list),
+        "http://127.0.0.1/api/v1/sigmarule/text/": MockResponse(
+            json_data=sigmarule_rule_text_mock
         ),
     }
 

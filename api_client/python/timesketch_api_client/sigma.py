@@ -307,7 +307,7 @@ class SigmaRule(resource.BaseResource):
             self.set_value(key, value)
 
     def from_rule_uuid(self, rule_uuid):
-        """Get a Sigma object from a rule uuid.
+        """NEW: Get a Sigma object from a rule uuid.
 
         Args:
             rule_uuid: Id of the sigma rule.
@@ -325,7 +325,7 @@ class SigmaRule(resource.BaseResource):
             self.set_value(key, value)
 
     def from_text(self, rule_text):
-        """Get a Sigma object from a rule text.
+        """NEW: Get a Sigma object from a rule text.
 
         Args:
             rule_text: Rule text to be parsed.
@@ -337,7 +337,7 @@ class SigmaRule(resource.BaseResource):
         data = {"title": "Get_Sigma_by_text", "content": rule_text}
         response = self.api.session.post(self.resource_uri, json=data)
         response_dict = error.get_response_json(response, logger)
-
+        breakpoint()
         objects = response_dict.get("objects")
         if not objects:
             logger.warning("Unable to parse rule with given text")

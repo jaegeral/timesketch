@@ -201,20 +201,21 @@ class TimesketchSigmaRuleTest(unittest.TestCase):
 
     def test_get_sigma_rule_by_text(self):
         """NEW: Testing the SigmaRule by text"""
-        rule = self.api_client.get_sigma_rule_by_text(MOCK_SIGMA_RULE)
+        rule = self.api_client.get_sigmarule_rule_by_text(MOCK_SIGMA_RULE)
 
         self.assertIsNotNone(rule)
         self.assertGreater(len(rule.attributes), 5)
-        self.assertIn("zsh", rule.es_query)
+        self.assertIn("zsh", rule.query_string)
         self.assertIn("Installation of foobar", rule.title)
         self.assertIn("", rule.id)
-        self.assertIn("", rule.file_relpath)
-        self.assertIn("http://127.0.0.1/api/v1/sigma/text/", rule.resource_uri)
+        #self.assertIn("", rule.file_relpath)
+        #self.assertRaises(NotImplementedError, rule.get("file_relpath"))
+        self.assertIn("http://127.0.0.1/api/v1/sigmarule/text/", rule.resource_uri)
         self.assertIn("suspicious installation of foobar", rule.description)
         self.assertIn("high", rule.level)
         self.assertEqual(len(rule.falsepositives), 1)
         self.assertIn("Unknown", rule.falsepositives[0])
-        self.assertIn("N/A", rule.file_name)
+        #self.assertIn("N/A", rule.file_name)
         self.assertIn("Alexander", rule.author)
         self.assertIn("2020/12/10", rule.date)
         self.assertIn("2021/01/01", rule.modified)
