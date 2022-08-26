@@ -55,7 +55,7 @@ modified: 2020/06/26
 
 
 class TimesketchSigmaTest(unittest.TestCase):
-    """Test Sigma."""
+    """DEPRECATED: Test Sigma."""
 
     @mock.patch("requests.Session", test_lib.mock_session)
     def setUp(self):
@@ -63,7 +63,7 @@ class TimesketchSigmaTest(unittest.TestCase):
         self.api_client = client.TimesketchApi("http://127.0.0.1", "test", "test")
 
     def test_sigma_rule(self):
-        """Test single Sigma rule."""
+        """DEPRECATED: Test single Sigma rule."""
 
         rule = self.api_client.get_sigma_rule(
             rule_uuid="5266a592-b793-11ea-b3de-0242ac130004"
@@ -92,7 +92,7 @@ class TimesketchSigmaTest(unittest.TestCase):
         self.assertEqual(len(rule.logsource), 2)
 
     def test_sigma_rules(self):
-        """Testing the Sigma rules list"""
+        """DEPRECATED: Testing the Sigma rules list"""
 
         rules = self.api_client.list_sigma_rules()
         self.assertIsNotNone(rules)
@@ -116,6 +116,7 @@ class TimesketchSigmaTest(unittest.TestCase):
         self.assertIn("foobar.com", rule.references[0])
 
     def test_get_sigma_rule_by_text(self):
+        """DEPRECATED: Testing the Sigma rule by text"""
 
         rule = self.api_client.get_sigma_rule_by_text(MOCK_SIGMA_RULE)
 
@@ -138,7 +139,7 @@ class TimesketchSigmaTest(unittest.TestCase):
         self.assertEqual(len(rule.logsource), 2)
 
 class TimesketchSigmaRuleTest(unittest.TestCase):
-    """Test SigmaRule."""
+    """NEW: Test SigmaRule."""
 
     @mock.patch("requests.Session", test_lib.mock_session)
     def setUp(self):
@@ -146,7 +147,7 @@ class TimesketchSigmaRuleTest(unittest.TestCase):
         self.api_client = client.TimesketchApi("http://127.0.0.1", "test", "test")
 
     def test_sigma_rule(self):
-        """Test single SigmaRule rule."""
+        """NEW: Test single SigmaRule rule."""
 
         rule = self.api_client.get_sigma_rule(
             rule_uuid="5266a592-b793-11ea-b3de-0242ac130004"
@@ -175,7 +176,7 @@ class TimesketchSigmaRuleTest(unittest.TestCase):
         self.assertEqual(len(rule.logsource), 2)
 
     def test_sigma_rules(self):
-        """Testing the SigmaRule rules list"""
+        """NEW: Testing the SigmaRule rules list"""
 
         rules = self.api_client.list_sigma_rules()
         self.assertIsNotNone(rules)
@@ -199,7 +200,7 @@ class TimesketchSigmaRuleTest(unittest.TestCase):
         self.assertIn("foobar.com", rule.references[0])
 
     def test_get_sigma_rule_by_text(self):
-        """Testing the SigmaRule by text"""
+        """NEW: Testing the SigmaRule by text"""
         rule = self.api_client.get_sigma_rule_by_text(MOCK_SIGMA_RULE)
 
         self.assertIsNotNone(rule)

@@ -19,9 +19,11 @@ import logging
 from . import resource
 from . import error
 
+from deprecated import deprecated
+
 logger = logging.getLogger("timesketch_api.sigma")
 
-
+@deprecated(reason="Moving to database based calls")
 class Sigma(resource.BaseResource):
     """Timesketch sigma object.
 
@@ -143,6 +145,7 @@ class Sigma(resource.BaseResource):
         for key, value in rule_dict.items():
             self.set_value(key, value)
 
+    @deprecated(reason="Moving to database based calls")
     def from_rule_uuid(self, rule_uuid):
         """Get a Sigma object from a rule uuid.
 
@@ -161,6 +164,7 @@ class Sigma(resource.BaseResource):
         for key, value in rule_dict.items():
             self.set_value(key, value)
 
+    @deprecated(reason="Moving to database based calls")
     def from_text(self, rule_text):
         """Get a Sigma object from a rule text.
 
@@ -334,7 +338,6 @@ class SigmaRule(resource.BaseResource):
         Raises:
             ValueError: If no response was given
         """
-        breakpoint()
         self.resource_uri = "{0:s}/sigmarule/text/".format(self.api.api_root)
         data = {"title": "Get_Sigma_by_text", "content": rule_text}
         response = self.api.session.post(self.resource_uri, json=data)

@@ -40,6 +40,8 @@ from . import user
 from . import version
 from . import sigma
 
+from deprecated import deprecated
+
 
 logger = logging.getLogger("timesketch_api.client")
 
@@ -555,8 +557,9 @@ class TimesketchApi:
         request = google.auth.transport.requests.Request()
         self.credentials.credential.refresh(request)
 
+    @deprecated(reason="Moving to database based calls")
     def list_sigma_rules(self, as_pandas=False):
-        """Get a list of sigma objects.
+        """DEPRECATED: Get a list of sigma objects.
 
         Args:
             as_pandas: Boolean indicating that the results will be returned
@@ -588,8 +591,9 @@ class TimesketchApi:
             rules.append(index_obj)
         return rules
 
+    @deprecated(reason="Moving to database based calls")
     def get_sigma_rule(self, rule_uuid):
-        """Get a sigma rule.
+        """DEPRECATED: Get a sigma rule.
 
         Args:
             rule_uuid: UUID of the Sigma rule.
@@ -602,8 +606,9 @@ class TimesketchApi:
 
         return sigma_obj
 
+    @deprecated(reason="Moving to database based calls")
     def get_sigma_rule_by_text(self, rule_text):
-        """Returns a Sigma Object based on a sigma rule text.
+        """DEPRECATED: Returns a Sigma Object based on a sigma rule text.
 
         Args:
             rule_text: Full Sigma rule text.
