@@ -337,7 +337,6 @@ class SigmaRule(resource.BaseResource):
         data = {"title": "Get_Sigma_by_text", "content": rule_text}
         response = self.api.session.post(self.resource_uri, json=data)
         response_dict = error.get_response_json(response, logger)
-        breakpoint()
         objects = response_dict.get("objects")
         if not objects:
             logger.warning("Unable to parse rule with given text")
