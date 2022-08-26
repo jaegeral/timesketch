@@ -17,6 +17,7 @@ from __future__ import unicode_literals
 import unittest
 import mock
 
+from timesketch_api_client import sigma
 from . import client
 from . import sketch as sketch_lib
 from . import test_lib

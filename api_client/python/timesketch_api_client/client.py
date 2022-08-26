@@ -624,3 +624,74 @@ class TimesketchApi:
             logger.error("Parsing Error, unable to parse the Sigma rule", exc_info=True)
 
         return sigma_obj
+
+    def list_sigmarule_rules(self, as_pandas=False):
+        """Get a list of sigma objects.
+
+        Args:
+            as_pandas: Boolean indicating that the results will be returned
+                as a Pandas DataFrame instead of a list of dicts.
+
+        Returns:
+            List of Sigme rule object instances or a pandas Dataframe with all
+            rules if as_pandas is True.
+
+        Raises:
+            ValueError: If no rules are found.
+        """
+        rules = []
+        response = self.fetch_resource_data("sigmarule/")
+
+        if not response:
+            raise ValueError("No rules found.")
+
+        if as_pandas:
+            return pandas.DataFrame.from_records(response.get("objects"))
+
+        for rule_dict in response["objects"]:
+            if not rule_dict:
+                raise ValueError("No rules found.")
+
+            index_obj = sigma.SigmaRule(api=self)
+            for key, value in rule_dict.items():
+                index_obj.set_value(key, value)
+            rules.append(index_obj)
+        return rules
+
+    def get_sigmarule_rule(self, rule_uuid):
+        """Get a sigma rule.
+
+        Args:
+            rule_uuid: UUID of the Sigma rule.
+
+        Returns:
+            Instance of a Sigma object.
+        """
+        sigma_obj = sigma.SigmaRule(api=self)
+        sigma_obj.from_rule_uuid(rule_uuid)
+
+        return sigma_obj
+
+    def get_sigmarule_rule_by_text(self, rule_text):
+        """Returns a Sigma Object based on a sigma rule text.
+
+        Args:
+            rule_text: Full Sigma rule text.
+
+        Returns:
+            Instance of a Sigma object.
+
+        Raises:
+            ValueError: No Rule text given or issues parsing it.
+        """
+        if not rule_text:
+            raise ValueError("No rule text given.")
+
+        breakpoint()
+        try:
+            sigma_obj = sigma.SigmaRule(api=self)
+            sigma_obj.from_text(rule_text)
+        except ValueError:
+            logger.error("Parsing Error, unable to parse the Sigma rule", exc_info=True)
+
+        return sigma_obj
