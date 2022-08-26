@@ -19,13 +19,10 @@ import logging
 from . import resource
 from . import error
 
-from deprecated import deprecated
-
 logger = logging.getLogger("timesketch_api.sigma")
 
-@deprecated(reason="Moving to database based calls")
 class Sigma(resource.BaseResource):
-    """Timesketch sigma object.
+    """DEPRECATED: Timesketch sigma object.
 
     A sigma object in Timesketch is a collection of one or more rules.
 
@@ -145,9 +142,8 @@ class Sigma(resource.BaseResource):
         for key, value in rule_dict.items():
             self.set_value(key, value)
 
-    @deprecated(reason="Moving to database based calls")
     def from_rule_uuid(self, rule_uuid):
-        """Get a Sigma object from a rule uuid.
+        """DEPRECATED: Get a Sigma object from a rule uuid.
 
         Args:
             rule_uuid: Id of the sigma rule.
@@ -164,9 +160,8 @@ class Sigma(resource.BaseResource):
         for key, value in rule_dict.items():
             self.set_value(key, value)
 
-    @deprecated(reason="Moving to database based calls")
     def from_text(self, rule_text):
-        """Get a Sigma object from a rule text.
+        """DEPRECATED: Get a Sigma object from a rule text.
 
         Args:
             rule_text: Rule text to be parsed.
@@ -189,7 +184,7 @@ class Sigma(resource.BaseResource):
             self.set_value(key, value)
 
 class SigmaRule(resource.BaseResource):
-    """Timesketch SigmaRule object.
+    """NEW: Timesketch SigmaRule object.
 
     A sigmarule object in Timesketch is a collection of one or more rules.
 
