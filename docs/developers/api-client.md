@@ -389,6 +389,15 @@ search_obj.to_file('/tmp/myresults.zip')
 (use the ZIP ending, since the resulting file will be a ZIP file with both the
 results as a CSV file and a METADATA file.
 
+#### Limit the search to a timeline
+
+When running `search_obj.indices` by default it will teturn `["_all"]` and you can do:
+
+```
+search_obj.indices = ["timeline_name1"]
+```
+
+and execute your search and it will limit it to the choosen Timeline.
 
 #### Store a Search
 
