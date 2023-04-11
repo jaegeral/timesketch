@@ -346,6 +346,26 @@ def read_and_validate_csv(
                 # Remove all NAN values from the pandas.Series.
                 row.dropna(inplace=True)
                 MAX_TIMESTAMP_DIFFERENCE = 1000  # 1 second
+                # TODO(jaegeral): This is a temporary starting to work on it
+                if "timestamp" in row:
+                    # determine timestamp precision
+                    # current time in unix timestamp
+                    current_time = int(time.time())
+                    logger.warning("Current time: {0!s} is in s".format(current_time))
+                    # if timestamp value is larger then current_time it is in ms
+                    if row["timestamp"] > current_time:
+                        logger.warning(
+                            "Current value: {0!s} is in ms".format(row["timestamp"])
+                        )
+                    elif row["timestamp"] < current_time:
+                        logger.warning(
+                            "Current value: {0!s} is in s".format(row["timestamp"])
+                        )
+                        row["timestamp"] = row["timestamp"] * 1000
+                        logger.warning(
+                            "Converted value: {0!s} is in ms".format(row["timestamp"])
+                        )
+
                 # check datetime plausibility
                 if "timestamp" in row and "datetime" in row:
                     timestamp_calculated = int(

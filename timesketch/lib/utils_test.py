@@ -16,6 +16,7 @@
 from __future__ import unicode_literals
 
 import re
+import tempfile
 import pandas as pd
 
 from timesketch.lib.testlib import BaseTest
@@ -209,6 +210,31 @@ class TestUtils(BaseTest):
                 "WARNING:timesketch.utils:2 rows with missing timestamp field or it was empty ",  # pylint: disable=line-too-long
                 log.output,
             )
+
+    def test_timestamp_accuracy_seconds(self):
+        """Test for timestamp accuracy in CSV file"""
+        # create a temp csv file
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.write("datetime,timestamp_desc,message,timestamp\n")
+            temp_file.write("2022-07-24T19:01:01,Test,Test,1658689261\n")
+
+        with self.assertRaises(DataIngestionError):
+            # assert if certain lines are written to the log
+            with self.assertLogs(level="WARNING") as log:
+                # Call next to work around lazy generators.
+
+                foobar = read_and_validate_csv(temp_file.name)
+                # read over foobar
+                for _ in foobar:
+                    self.assertEqual(1658689261, _["timestamp"])
+                    pass
+
+                temp_file.close()
+
+                self.assertIn(
+                    "Timestamp difference between 1658689261000 and 1658689261000000 is too big 1657030571739000, aborting ingestion.",  # pylint: disable=line-too-long
+                    log.output,
+                )
 
     def test_invalid_JSONL_file(self):
         """Test for JSONL with missing keys in the dictionary wrt headers mapping"""
