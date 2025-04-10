@@ -1930,3 +1930,153 @@ def export_sketch(sketch_id: int, output_format: str, filename: str):
         print(f"An unexpected error occurred during export: {e}")
         print(traceback.format_exc())
         return
+
+
+import random
+import string
+import csv
+from tqdm import tqdm  # Import tqdm
+from datetime import timezone  # Import timezone specifically
+
+# Define standard fields for the dummy CSV
+DUMMY_CSV_HEADERS = [
+    "message",
+    "datetime",
+    "timestamp_desc",
+    "timestamp",  # Often derived, but good to include
+    "hostname",
+    "username",
+    "source_short",
+    "custom_field_1",
+    "numeric_field",
+    "tsctl_generator",
+]
+
+GENERATOR_TAG_VALUE = "tsctl_dummy_csv"
+
+
+# Helper function to generate random data
+def _generate_random_event(start_time, end_time):
+    """Generates a dictionary representing a single random event."""
+    # Generate random datetime and timestamp
+    dt_object = start_time + datetime.timedelta(
+        seconds=random.randint(0, int((end_time - start_time).total_seconds()))
+    )
+    # Ensure timezone-aware datetime in UTC
+    dt_object_utc = dt_object.replace(tzinfo=timezone.utc)
+    iso_datetime = dt_object_utc.isoformat()
+    unix_timestamp = int(dt_object_utc.timestamp())
+
+    # Generate other random fields
+    message_verbs = ["Accessed", "Modified", "Created", "Deleted", "Logged", "Failed"]
+    message_nouns = ["file.txt", "registry key", "process", "user account", "config"]
+    message = f"{random.choice(message_verbs)} {random.choice(message_nouns)} by user."
+
+    timestamp_desc = random.choice(
+        [
+            "File Creation Time",
+            "Last Access Time",
+            "Metadata Change Time",
+            "Event Logged Time",
+            "Session Start",
+        ]
+    )
+
+    hostname = f"host-{random.randint(100, 999)}.example.com"
+    username = random.choice(["alice", "bob", "charlie", "eve", "system", "admin"])
+    source_short = random.choice(["LOG", "WEBHIST", "REG", "FILE", "AUTH"])
+
+    custom_field_1 = "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=8)
+    )
+    numeric_field = random.randint(0, 10000)
+
+    return {
+        "message": message,
+        "datetime": iso_datetime,
+        "timestamp_desc": timestamp_desc,
+        "timestamp": unix_timestamp,
+        "hostname": hostname,
+        "username": username,
+        "source_short": source_short,
+        "custom_field_1": custom_field_1,
+        "numeric_field": numeric_field,
+        "tsctl_generator": GENERATOR_TAG_VALUE,
+    }
+
+
+@cli.command(name="generate-dummy-csv")
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Path to the output CSV file.",
+)
+@click.option(
+    "--count",
+    "-c",
+    required=True,
+    type=click.IntRange(min=1),  # Ensure at least 1 event
+    help="Number of dummy events to generate.",
+)
+@click.option(
+    "--start-date",
+    required=True,
+    type=click.DateTime(),  # Accepts formats like YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+    help="Start date/time for event generation (inclusive). E.g., '2023-10-26' or '2023-10-26T10:00:00'. Assumed UTC if no timezone specified.",
+)
+@click.option(
+    "--end-date",
+    required=True,
+    type=click.DateTime(),
+    help="End date/time for event generation (inclusive). E.g., '2023-10-27' or '2023-10-27T18:30:00'. Assumed UTC if no timezone specified.",
+)
+def generate_dummy_csv(
+    output: str, count: int, start_date: datetime.datetime, end_date: datetime.datetime
+):
+    """Generates a CSV file with random dummy event data within a specified timeframe.
+
+    This command creates a CSV file suitable for testing Timesketch imports.
+    It includes standard fields like 'datetime', 'timestamp_desc', and 'message',
+    along with other common fields populated with random but valid data.
+    The timestamps generated will be randomly distributed between the specified
+    --start-date and --end-date (inclusive). Dates are interpreted as UTC.
+    """
+
+    # Ensure dates are timezone-aware UTC
+    if start_date.tzinfo is None:
+        start_time_utc = start_date.replace(tzinfo=timezone.utc)
+    else:
+        start_time_utc = start_date.astimezone(timezone.utc)
+
+    if end_date.tzinfo is None:
+        end_time_utc = end_date.replace(tzinfo=timezone.utc)
+    else:
+        end_time_utc = end_date.astimezone(timezone.utc)
+
+    # Validate date range
+    if end_time_utc < start_time_utc:
+        print("ERROR: End date cannot be earlier than start date.")
+        return
+
+    print(f"Generating {count} dummy events to {output}...")
+    print(f"Time range: {start_time_utc.isoformat()} to {end_time_utc.isoformat()}")
+
+    try:
+        with open(output, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=DUMMY_CSV_HEADERS)
+            writer.writeheader()
+
+            for _ in tqdm(range(count), desc="Generating Events", unit="event"):
+                # Pass the timezone-aware UTC dates to the helper
+                event_data = _generate_random_event(start_time_utc, end_time_utc)
+                writer.writerow(event_data)
+
+        print(f"\nSuccessfully generated {count} events to {output}")
+
+    except IOError as e:
+        print(f"ERROR: Could not write to file {output}: {e}")
+    except Exception as e:
+        print(traceback.format_exc())
+        print(f"An unexpected error occurred: {type(e).__name__} - {e}")
