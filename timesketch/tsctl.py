@@ -1935,6 +1935,7 @@ def export_sketch(sketch_id: int, output_format: str, filename: str):
 import random
 import string
 import csv
+from tqdm import tqdm  # Import tqdm
 from datetime import timezone  # Import timezone specifically
 
 # Define standard fields for the dummy CSV
@@ -2065,17 +2066,12 @@ def generate_dummy_csv(
             writer = csv.DictWriter(csvfile, fieldnames=DUMMY_CSV_HEADERS)
             writer.writeheader()
 
-            for i in range(count):
+            for _ in tqdm(range(count), desc="Generating Events", unit="event"):
                 # Pass the timezone-aware UTC dates to the helper
                 event_data = _generate_random_event(start_time_utc, end_time_utc)
                 writer.writerow(event_data)
-                # Optional: Add progress indicator for large counts
-                if (i + 1) % 1000 == 0 or (
-                    i + 1
-                ) == count:  # Show progress and final count
-                    print(f"  Generated {i + 1}/{count} events...")
 
-        print(f"Successfully generated {count} events to {output}")
+        print(f"\nSuccessfully generated {count} events to {output}")
 
     except IOError as e:
         print(f"ERROR: Could not write to file {output}: {e}")
