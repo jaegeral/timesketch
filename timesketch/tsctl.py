@@ -2079,4 +2079,4 @@ def generate_dummy_csv(
         print(f"ERROR: Could not write to file {output}: {e}")
     except Exception as e:
         print(traceback.format_exc())
-        logger.exception(f"An unexpected error occurred: {type(e).__name__} - {e}")
+        print(f"An unexpected error occurred: {type(e).__name__} - {e}")
