@@ -1952,6 +1952,8 @@ DUMMY_CSV_HEADERS = [
     "tsctl_generator",
 ]
 
+GENERATOR_TAG_VALUE = "tsctl_dummy_csv"
+
 
 # Helper function to generate random data
 def _generate_random_event(start_time, end_time):
@@ -1999,7 +2001,7 @@ def _generate_random_event(start_time, end_time):
         "source_short": source_short,
         "custom_field_1": custom_field_1,
         "numeric_field": numeric_field,
-        "tsctl_generator": "tsctl_dummy_csv",
+        "tsctl_generator": GENERATOR_TAG_VALUE,
     }
 
 
@@ -2076,5 +2078,5 @@ def generate_dummy_csv(
     except IOError as e:
         print(f"ERROR: Could not write to file {output}: {e}")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        print(traceback.format_exc())  # Print traceback for unexpected errors
+        print(traceback.format_exc())
+        logger.exception(f"An unexpected error occurred: {type(e).__name__} - {e}")
