@@ -1107,7 +1107,25 @@ class Search(resource.SketchResource):
         return True
 
     def to_pandas(self):
-        """Returns a pandas DataFrame with the response of the query."""
+        """Returns a pandas DataFrame with the response of the query.
+
+        If the query has not been executed yet, this method will execute it
+        before returning the results.
+
+        Additionally, this method attempts to create a 'datetime' column:
+        - If a 'datetime' column already exists, it's converted to
+          pandas datetime objects (coercing errors).
+        - Else if a 'timestamp' column exists, it's assumed to be in
+          microseconds, converted to seconds, and then to UTC datetime
+          objects (coercing errors).
+
+        Returns:
+            pandas.DataFrame: A DataFrame containing the query results.
+
+        Raises:
+            ValueError: If the query is executed and no results are returned
+                (i.e., the 'objects' list in the response is empty or None).
+        """
         if self._raw_response is None:
             self._raw_response = self._execute_query()
             if self._raw_response is None:
