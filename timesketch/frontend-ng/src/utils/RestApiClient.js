@@ -50,14 +50,7 @@ RestApiClient.interceptors.response.use(
 
       if (status === 500) {
         message = 'Server side error. Please contact your server administrator for troubleshooting.'
-      } else if (data && typeof data === 'object' && data.message) {
-        // Standard JSON error message from backend
-        message = data.message
-      } else if (typeof data === 'string' && data.trim().length > 0 && data.length < 500) {
-        // If data is a non-empty, reasonably short string, it might be the error message.
-        message = data.trim()
       } else if (error.message) {
-        // Fallback to Axios's error message if a more specific one isn't available
         // e.g., "Request failed with status code 404"
         // Prepend status for clarity if not already in error.message
         if (!error.message.includes(String(status))) {
