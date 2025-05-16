@@ -41,14 +41,43 @@ RestApiClient.interceptors.response.use(
     return response
   },
   function (error) {
-    if (error.response.status === 500) {
-      EventBus.$emit(
-        'errorSnackBar',
-        'Server side error. Please contact your server administrator for troubleshooting.'
-      )
+    let message = 'An unexpected error occurred. Please try again.'
+
+    if (error.response) {
+      // The request was made and the server responded with a status code
+      // that falls out of the range of 2xx
+      const { status, data } = error.response
+
+      if (status === 500) {
+        message = 'Server side error. Please contact your server administrator for troubleshooting.'
+      } else if (data && typeof data === 'object' && data.message) {
+        // Standard JSON error message from backend
+        message = data.message
+      } else if (typeof data === 'string' && data.trim().length > 0 && data.length < 500) {
+        // If data is a non-empty, reasonably short string, it might be the error message.
+        message = data.trim()
+      } else if (error.message) {
+        // Fallback to Axios's error message if a more specific one isn't available
+        // e.g., "Request failed with status code 404"
+        // Prepend status for clarity if not already in error.message
+        if (!error.message.includes(String(status))) {
+          message = `Error: ${status} - ${error.message}`
+        } else {
+          message = error.message
+        }
+      } else {
+        // Generic fallback for other HTTP errors
+        message = `An error occurred (Status: ${status}).`
+      }
+    } else if (error.request) {
+      // The request was made but no response was received (e.g., network error)
+      message = 'No response from server. Please check your network connection.'
     } else {
-      EventBus.$emit('errorSnackBar', error.response.data.message)
+      // Something happened in setting up the request that triggered an Error
+      message = `Request setup error: ${error.message || 'An unknown error occurred during request setup.'}`
     }
+
+    EventBus.$emit('errorSnackBar', message)
     return Promise.reject(error)
   }
 )
@@ -111,7 +140,7 @@ export default {
   getSketchTimelineAnalysis(sketchId, timelineId) {
     return RestApiClient.get('/sketches/' + sketchId + '/timelines/' + timelineId + '/analysis/')
   },
-  getTimelineFields(sketchId, timelineId){
+  getTimelineFields(sketchId, timelineId) {
     return RestApiClient.get('/sketches/' + sketchId + '/timelines/' + timelineId + '/fields/')
   },
   saveSketchTimeline(sketchId, timelineId, name, description, color) {
