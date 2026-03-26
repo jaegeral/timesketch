@@ -14,7 +14,7 @@ This utility automates the large-scale export of sketches from a Timesketch inst
 - **High-Signal Console Output**:
     - **Colored Status**: SUCCESS (Green), NOOP (Yellow), and FAILED (Red) labels for immediate visual feedback.
     - **Detailed Success Reporting**: Displays absolute file paths and human-readable file sizes (e.g., 1.50 GB) for every successful export.
-    - **Live Command Output**: Raw output from the `tsctl export-sketch` command is displayed in the console (indented) for real-time progress monitoring.
+    - **Real-time Progress monitoring**: Subprocess output (including progress bars) is streamed directly to the console as it happens.
 - **Actionable Failure Diagnostics**: If an export fails, the script:
     - Identifies the likely cause (e.g., empty sketch, index timeout).
     - Provides a specific **recommendation** directly in the console and the manifest.
@@ -42,7 +42,9 @@ The script supports several command-line arguments:
 - `--min-disk-gb`: Hard stop threshold for free space (Default: 50).
 - `--settle-delay`: Wait time after closing indices (Default: 60).
 - `--include-deleted`: If set, sketches in the `deleted` state will also be exported.
+- `--all-statuses`: If set, sketches will be exported regardless of their current status.
 - `--annotated-only`: If set, only events with annotations (labels, stars, comments) will be exported.
+- `--include-legacy`: If set, legacy events (missing `__ts_timeline_id`) will be included in the export.
 - `--start-id`: Process sketches starting from this ID.
 - `--end-id`: Process sketches up to this ID.
 - `--limit`: Max number of sketches to process in this run.

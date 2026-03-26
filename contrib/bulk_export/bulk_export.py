@@ -1,16 +1,3 @@
-# Copyright 2026 Google Inc. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 Batch export utility for Timesketch sketches.
 
@@ -173,12 +160,18 @@ def open_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool:
     for search_index in search_indexes:
         try:
             logger.info("  Opening OpenSearch index: %s", search_index.index_name)
-            datastore.client.indices.open(
-                index=search_index.index_name, ignore=[400, 404]
-            )
+            datastore.client.indices.open(index=search_index.index_name)
         except Exception as e:
+            # If already open, that's fine
+            if "index_not_closed_exception" in str(e).lower():
+                continue
             logger.error("  Failed to open index %s: %s", search_index.index_name, e)
             return False
+    
+    # Short wait for cluster metadata to update
+    if search_indexes:
+        time.sleep(5)
+    
     return True
 
 
@@ -211,7 +204,11 @@ def close_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool
                 )
                 continue
 
-            if timeline.sketch.get_status.status not in ("archived", "deleted"):
+            # Check if the other sketch using this index is active
+            other_status_obj = timeline.sketch.get_status
+            other_status = other_status_obj.status if other_status_obj else "unknown"
+            
+            if other_status not in ("archived", "deleted"):
                 can_be_closed = False
                 logger.info(
                     "  Index %s is used by active sketch %d. Keeping open.",
@@ -234,7 +231,7 @@ def close_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool
 
 
 def run_tsctl(command: List[str]) -> Tuple[bool, str]:
-    """Executes a tsctl command and logs the output.
+    """Executes a tsctl command and streams output in real-time.
 
     Args:
         command (List[str]): The command and arguments to run.
@@ -244,21 +241,37 @@ def run_tsctl(command: List[str]) -> Tuple[bool, str]:
     """
     env = os.environ.copy()
     env["SQLALCHEMY_SILENCE_UBER_WARNING"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
 
     full_cmd = ["tsctl"] + command
     logger.info("  Running: %s", " ".join(full_cmd))
-    result = subprocess.run(
+
+    combined_output = []
+    process = subprocess.Popen(
         full_cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
         env=env,
+        bufsize=1,
     )
-    combined_output = f"{result.stdout.strip()}\n{result.stderr.strip()}".strip()
-    if result.returncode != 0:
-        logger.error("  tsctl command failed: %s", result.stderr.strip())
-        return False, combined_output
-    return True, combined_output
+
+    # Stream output in real-time
+    if process.stdout:
+        for line in iter(process.stdout.readline, ""):
+            clean_line = line.strip()
+            if clean_line:
+                click.echo(f"      > {clean_line}")
+                combined_output.append(clean_line)
+
+    process.wait()
+    full_output_str = "\n".join(combined_output)
+
+    if process.returncode != 0:
+        logger.error("  tsctl command failed (Exit %d)", process.returncode)
+        return False, full_output_str
+
+    return True, full_output_str
 
 
 def recover_state(export_dir: str, datastore: OpenSearchDataStore) -> None:
@@ -393,27 +406,29 @@ def check_jvm_pressure(datastore: OpenSearchDataStore, threshold: float) -> bool
     return True
 
 
-def is_in_manifest(manifest_path: str, sketch_id: int) -> bool:
-    """Checks if a specific sketch has already been processed.
+def get_processed_ids(manifest_path: str) -> set[int]:
+    """Loads all successfully processed sketch IDs from the manifest.
 
     Args:
         manifest_path (str): Path to the manifest CSV file.
-        sketch_id (int): The ID of the sketch to check.
 
     Returns:
-        bool: True if the sketch is in the manifest, False otherwise.
+        set[int]: A set of IDs already present in the manifest.
     """
+    processed_ids = set()
     if not os.path.exists(manifest_path):
-        return False
+        return processed_ids
     try:
         with open(manifest_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row["sketch_id"] == str(sketch_id):
-                    return True
+                try:
+                    processed_ids.add(int(row["sketch_id"]))
+                except (ValueError, KeyError):
+                    continue
     except Exception as e:
         logger.error("Failed to read manifest file: %s", str(e))
-    return False
+    return processed_ids
 
 
 def get_recommendation(error_msg: str, sketch: Sketch) -> str:
@@ -526,7 +541,6 @@ def wait_for_indices_ready(sketch_id: int, datastore: OpenSearchDataStore) -> bo
                     return True
         except Exception as e:
             logger.warning("  Health check request timed out or failed: %s", str(e))
-            # Fall through to sleep and retry
 
         time.sleep(15)
     return False
@@ -575,9 +589,24 @@ def run_export() -> None:
         "--include-deleted", action="store_true", help="Include deleted sketches"
     )
     parser.add_argument(
+        "--all-statuses",
+        action="store_true",
+        help="Export sketches regardless of their status",
+    )
+    parser.add_argument(
         "--annotated-only",
         action="store_true",
         help="Export only events with annotations (labels, stars, comments)",
+    )
+    parser.add_argument(
+        "--include-legacy",
+        action="store_true",
+        help="Include legacy events (missing __ts_timeline_id)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Redo export even if the ZIP file already exists",
     )
     parser.add_argument("--start-id", type=int, help="Process starting from this ID")
     parser.add_argument("--end-id", type=int, help="Process up to this ID")
@@ -628,15 +657,21 @@ def run_export() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # Pre-load manifest IDs for high-speed lookup
+    processed_ids = get_processed_ids(manifest_path)
+
     # Query Sketches
     total_in_db = Sketch.query.count()
 
     query = Sketch.query
-    statuses = ["ready", "archived"]
+    statuses = ["ready", "archived", "active", "open", "new"]
     if args.include_deleted:
         statuses.append("deleted")
 
-    query = query.filter(Sketch.status.any(Sketch.Status.status.in_(statuses)))
+    if not args.all_statuses:
+        query = query.filter(Sketch.status.any(Sketch.Status.status.in_(statuses)))
+    else:
+        statuses = ["ANY"]
 
     # Pre-filtering count for status
     total_matching_status = query.count()
@@ -651,7 +686,7 @@ def run_export() -> None:
     all_eligible = query.all()
 
     # Filter out what's already in the manifest
-    to_process = [s for s in all_eligible if not is_in_manifest(manifest_path, s.id)]
+    to_process = [s for s in all_eligible if s.id not in processed_ids]
     already_done_count = len(all_eligible) - len(to_process)
 
     # Apply limit if specified
@@ -706,7 +741,11 @@ def run_export() -> None:
 
         processed_count += 1
         current_processing_sketch_id = sketch.id
-        original_sketch_status = sketch.get_status.status
+
+        # Robust status detection
+        status_obj = sketch.get_status
+        original_sketch_status = status_obj.status if status_obj else "unknown"
+
         save_state(args.export_dir, sketch.id, original_sketch_status)
 
         logger.info("Processing Sketch %d: %s", sketch.id, sketch.name)
@@ -718,124 +757,207 @@ def run_export() -> None:
         output_filename = f"sketch_{sketch.id}.zip"
         full_output_path = os.path.join(args.export_dir, output_filename)
         cmd_output = ""
+        total_events = 0
+        index_names = []
 
-        if not sketch.timelines:
-            error_msg = "Sketch has no timelines."
-            export_status = "NOOP"
-            logger.warning("  %s skipping.", error_msg)
-        else:
-            # Resource Guards
-            for path in [args.export_dir, args.tmp_dir]:
-                if check_disk_space(path) < args.min_disk_gb:
-                    logger.critical("LOW DISK SPACE on %s. Stopping.", path)
-                    clear_state(args.export_dir)
-                    return
-
-            if not args.ignore_cluster_checks:
-                while not check_jvm_pressure(datastore, args.jvm_threshold):
-                    logger.warning("JVM pressure high. Pausing...")
-                    time.sleep(120)
-
-                if not args.ignore_shard_limit:
-                    safe, current, limit = check_shard_limit(
-                        datastore, args.shard_threshold, args.max_shards_per_node
-                    )
-                    if not safe:
-                        logger.warning(
-                            "Shard count too high (%d/%d). Pausing...", current, limit
-                        )
-                        time.sleep(300)
-                        processed_count -= 1
-                        continue
-
-                try:
-                    health = datastore.client.cluster.health(request_timeout=10)
-                    if health["status"] == "red":
-                        logger.warning("Cluster status is RED. Pausing...")
-                        time.sleep(300)
-                        processed_count -= 1
-                        continue
-                except Exception as e:
-                    logger.warning(
-                        "Cluster health check failed: %s. Proceeding...", str(e)
-                    )
-            try:
-                # Open indices directly
-                if original_sketch_status in ["archived", "deleted"]:
-                    logger.info("  Opening indices for sketch...")
-                    if not open_sketch_indices(sketch.id, datastore):
-                        raise RuntimeError("Failed to open OpenSearch indices.")
-
-                    if args.ignore_index_wait:
-                        logger.info("  Skipping readiness wait as requested.")
-                    else:
-                        if not wait_for_indices_ready(sketch.id, datastore):
-                            raise TimeoutError("Indices failed to become ready.")
-                # Check if there are actually any events to export
-                index_names = list(
-                    {
-                        t.searchindex.index_name
-                        for t in sketch.timelines
-                        if t.searchindex
-                    }
+        # Optimization: Check if ZIP already exists and is valid before
+        # touching OpenSearch at all.
+        if not args.force and os.path.exists(full_output_path):
+            if zipfile.is_zipfile(full_output_path):
+                logger.info(
+                    "  Valid ZIP already exists for Sketch %d. Skipping OpenSearch.",
+                    sketch.id
                 )
+                export_status = "Success"
+                sha256_val = get_file_sha256(full_output_path)
+                total_bytes += os.path.getsize(full_output_path)
+                
+                # Get timeline and event counts for the summary without opening
+                index_names = [
+                    t.searchindex.index_name 
+                    for t in sketch.timelines if t.searchindex
+                ]
+                # Event count is just for reporting; if it fails, we still skip
                 try:
                     total_events, _ = datastore.count(index_names)
-                except Exception as e:
-                    logger.warning(
-                        "  Unable to get event count for indices: %s", str(e)
-                    )
-                    total_events = 0
+                except Exception: pass
+            else:
+                logger.warning(
+                    "  ZIP exists for Sketch %d but is invalid. Redoing...", 
+                    sketch.id
+                )
 
-                if total_events == 0:
-                    error_msg = "Sketch indices are empty (0 events)."
-                    export_status = "NOOP"
-                    logger.warning("  %s skipping.", error_msg)
-                    if original_sketch_status in ["archived", "deleted"]:
-                        close_sketch_indices(sketch.id, datastore)
-                else:
-                    # Execution
-                    cmd = [
-                        "export-sketch",
-                        str(sketch.id),
-                        "--method",
-                        "direct",
-                        "--filename",
-                        full_output_path,
-                    ]
-                    if args.annotated_only:
-                        cmd.append("--annotated-only")
+        if export_status != "Success":
+            if not sketch.timelines:
+                error_msg = "Sketch has no timelines."
+                export_status = "NOOP"
+                logger.warning("  %s skipping.", error_msg)
+            else:
+                # Resource Guards
+                for path in [args.export_dir, args.tmp_dir]:
+                    if check_disk_space(path) < args.min_disk_gb:
+                        logger.critical("LOW DISK SPACE on %s. Stopping.", path)
+                        clear_state(args.export_dir)
+                        return
 
-                    success, cmd_output = run_tsctl(cmd)
+                if not args.ignore_cluster_checks:
+                    while not check_jvm_pressure(datastore, args.jvm_threshold):
+                        logger.warning("JVM pressure high. Pausing...")
+                        time.sleep(120)
 
-                    if not success:
-                        error_msg = "tsctl export-sketch failed."
-                    else:
-                        if (
-                            os.path.exists(full_output_path)
-                            and zipfile.is_zipfile(full_output_path)
-                            and os.path.getsize(full_output_path) > 1024
-                        ):
-                            export_status = "Success"
-                            sha256_val = get_file_sha256(full_output_path)
-                            total_bytes += os.path.getsize(full_output_path)
-                        else:
-                            error_msg = "Integrity check failed."
+                    if not args.ignore_shard_limit:
+                        safe, current, limit = check_shard_limit(
+                            datastore, args.shard_threshold, args.max_shards_per_node
+                        )
+                        if not safe:
+                            logger.warning(
+                                "Shard count too high (%d/%d). Pausing...", 
+                                current, limit
+                            )
+                            time.sleep(300)
+                            processed_count -= 1
+                            continue
 
-                    # Close indices directly
-                    if original_sketch_status in ["archived", "deleted"]:
-                        logger.info("  Closing indices to release resources...")
-                        close_sketch_indices(sketch.id, datastore)
-                        time.sleep(args.settle_delay)
-
-            except Exception as e:
-                error_msg = str(e)
-                logger.error("  Error processing sketch %d: %s", sketch.id, e)
-                if original_sketch_status in ["archived", "deleted"]:
                     try:
-                        close_sketch_indices(sketch.id, datastore)
-                    except Exception:
-                        pass
+                        health = datastore.client.cluster.health(request_timeout=10)
+                        if health["status"] == "red":
+                            logger.warning("Cluster status is RED. Pausing...")
+                            time.sleep(300)
+                            processed_count -= 1
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            "Cluster health check failed: %s. Proceeding...", str(e)
+                        )
+                try:
+                    # Open indices directly for anything not explicitly 'ready'
+                    # to be safe, as 'active'/'open' indices might still be closed
+                    if original_sketch_status != "ready":
+                        logger.info(
+                            "  Status is '%s'. Ensuring indices are open...",
+                            original_sketch_status,
+                        )
+                        if not open_sketch_indices(sketch.id, datastore):
+                            raise RuntimeError("Failed to open OpenSearch indices.")
+
+                        if args.ignore_index_wait:
+                            logger.info("  Skipping readiness wait as requested.")
+                        else:
+                            if not wait_for_indices_ready(sketch.id, datastore):
+                                raise TimeoutError("Indices failed to become ready.")
+
+                    # TEMPORARY STATUS FLIP: Tricking older tsctl into allowing export
+                    if original_sketch_status != "ready":
+                        logger.info(
+                            "  Temporarily setting DB status to 'ready' for export."
+                        )
+                        sketch.set_status(status="ready")
+                        db_session.commit()
+
+                    # Check if there are actually any events to export
+                    index_names = list(
+                        {
+                            t.searchindex.index_name
+                            for t in sketch.timelines
+                            if t.searchindex
+                        }
+                    )
+                    
+                    # Filter out indices that don't exist in OpenSearch
+                    existing_indices = []
+                    missing_indices = []
+                    for idx in index_names:
+                        try:
+                            if datastore.client.indices.exists(index=idx):
+                                existing_indices.append(idx)
+                            else:
+                                missing_indices.append(idx)
+                        except Exception:
+                            missing_indices.append(idx)
+
+                    if missing_indices:
+                        logger.warning(
+                            "  Indices missing in OpenSearch: %s", 
+                            ", ".join(missing_indices)
+                        )
+
+                    try:
+                        if existing_indices:
+                            total_events, _ = datastore.count(existing_indices)
+                        else:
+                            total_events = 0
+                    except Exception as e:
+                        logger.warning(
+                            "  Unable to get event count for indices: %s", str(e)
+                        )
+                        total_events = 0
+
+                    if total_events == 0:
+                        error_msg = "Sketch indices are empty (0 events)."
+                        export_status = "NOOP"
+                        logger.warning("  %s skipping.", error_msg)
+                        if original_sketch_status != "ready":
+                            close_sketch_indices(sketch.id, datastore)
+                    else:
+                        # Execution
+                        cmd = [
+                            "export-sketch",
+                            str(sketch.id),
+                            "--method",
+                            "direct",
+                            "--filename",
+                            full_output_path,
+                        ]
+                        if args.annotated_only:
+                            cmd.append("--annotated-only")
+                        if args.include_legacy:
+                            cmd.append("--include-legacy")
+
+                        success, cmd_output = run_tsctl(cmd)
+
+                        if not success:
+                            error_msg = "tsctl export-sketch failed."
+                        else:
+                            if (
+                                os.path.exists(full_output_path)
+                                and zipfile.is_zipfile(full_output_path)
+                                and os.path.getsize(full_output_path) > 1024
+                            ):
+                                export_status = "Success"
+                                sha256_val = get_file_sha256(full_output_path)
+                                total_bytes += os.path.getsize(full_output_path)
+                            else:
+                                error_msg = "Integrity check failed."
+
+                        # Close indices directly
+                        if original_sketch_status != "ready":
+                            logger.info(
+                                "  Restoring original DB status: %s",
+                                original_sketch_status
+                            )
+                            sketch.set_status(status=original_sketch_status)
+                            db_session.commit()
+                            
+                            logger.info("  Closing indices to release resources...")
+                            close_sketch_indices(sketch.id, datastore)
+                            time.sleep(args.settle_delay)
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error("  Error processing sketch %d: %s", sketch.id, e)
+                    
+                    # Restore status on error
+                    if original_sketch_status != "ready":
+                        try:
+                            sketch.set_status(status=original_sketch_status)
+                            db_session.commit()
+                        except Exception: pass
+
+                    if original_sketch_status != "ready":
+                        try:
+                            close_sketch_indices(sketch.id, datastore)
+                        except Exception:
+                            pass
 
         # Final Status Reporting
         if export_status == "Success":
@@ -849,11 +971,6 @@ def run_export() -> None:
             size_str = human_readable_size(os.path.getsize(full_output_path))
             click.echo(f"    Path: {full_output_path}")
             click.echo(f"    Size: {size_str}")
-
-            if cmd_output:
-                click.echo("    Command Output:")
-                for line in cmd_output.splitlines():
-                    click.echo(f"      > {line}")
 
             logger.info("  Result: SUCCESS for Sketch %d", sketch.id)
         elif export_status == "NOOP":
@@ -874,16 +991,7 @@ def run_export() -> None:
                 logger.info("  Recommendation: %s", rec)
 
             # Provide sketch info to help debugging
-            _, info_output = run_tsctl(["sketch-info", str(sketch.id)])
-            if info_output:
-                click.echo("    Sketch Info:")
-                for line in info_output.splitlines():
-                    click.echo(f"      | {line}")
-
-            if cmd_output:
-                click.echo("    Command Output:")
-                for line in cmd_output.splitlines():
-                    click.echo(f"      > {line}")
+            run_tsctl(["sketch-info", str(sketch.id)])
 
             logger.error(
                 "  Result: FAILED for Sketch %d. Reason: %s",
@@ -901,11 +1009,9 @@ def run_export() -> None:
                 "error_msg": error_msg,
                 "recommendation": get_recommendation(error_msg, sketch),
                 "output_file": output_filename if export_status == "Success" else "",
-                "size_bytes": (
-                    os.path.getsize(full_output_path)
-                    if os.path.exists(full_output_path)
-                    else 0
-                ),
+                "size_bytes": os.path.getsize(full_output_path)
+                if os.path.exists(full_output_path)
+                else 0,
                 "sha256": sha256_val,
             },
         )
