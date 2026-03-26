@@ -42,11 +42,17 @@ The script supports several command-line arguments:
 - `--min-disk-gb`: Hard stop threshold for free space (Default: 50).
 - `--settle-delay`: Wait time after closing indices (Default: 60).
 - `--include-deleted`: If set, sketches in the `deleted` state will also be exported.
+- `--annotated-only`: If set, only events with annotations (labels, stars, comments) will be exported.
 - `--start-id`: Process sketches starting from this ID.
 - `--end-id`: Process sketches up to this ID.
 - `--limit`: Max number of sketches to process in this run.
+- `--log-file`: Explicit path to the log file (Default: `bulk_export.log` in export directory).
 - `--jvm-threshold`: JVM heap usage threshold as a float (0.0-1.0, Default: 0.85).
 - `--shard-threshold`: Shard count threshold as a float (0.0-1.0, Default: 0.9).
+- `--max-shards-per-node`: Manual override for shards per node limit.
+- `--ignore-shard-limit`: Disable the shard limit safety check.
+- `--ignore-cluster-checks`: Disable JVM pressure, shard limit, and cluster health checks entirely.
+- `--ignore-index-wait`: Skip waiting for OpenSearch indices to be ready after opening (use with caution).
 
 ## Usage
 

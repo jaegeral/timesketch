@@ -72,14 +72,22 @@ is_shutting_down = False
 logger = logging.getLogger("bulk_export")
 
 
-def setup_logging(export_dir: str) -> None:
-    """Configures logging to both console and a file in the export directory.
+def setup_logging(export_dir: str, log_path: Optional[str] = None) -> None:
+    """Configures logging to both console and a file.
 
     Args:
-        export_dir (str): Path to the directory where logs should be saved.
+        export_dir (str): Path to the directory where logs should be saved
+            by default.
+        log_path (str): Optional explicit path to the log file.
     """
     os.makedirs(export_dir, exist_ok=True)
-    log_file = os.path.join(export_dir, "bulk_export.log")
+    if log_path:
+        log_file = log_path
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+    else:
+        log_file = os.path.join(export_dir, "bulk_export.log")
 
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -96,6 +104,13 @@ def setup_logging(export_dir: str) -> None:
     logger.setLevel(logging.INFO)
     logger.addHandler(fh)
     logger.addHandler(sh)
+
+    # Prevent propagation to the root logger to avoid duplicate lines
+    logger.propagate = False
+
+    # Silence noisy library loggers
+    logging.getLogger("opensearch").setLevel(logging.ERROR)
+    logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 
 def get_file_sha256(file_path: str) -> str:
@@ -187,6 +202,15 @@ def close_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool
         for timeline in search_index.timelines:
             if timeline.sketch_id == sketch_id:
                 continue
+            
+            # Skip if timeline has no sketch (orphaned)
+            if not timeline.sketch:
+                logger.info(
+                    "  Timeline %d has no associated sketch (orphaned). Ignoring.",
+                    timeline.id,
+                )
+                continue
+
             if timeline.sketch.get_status.status not in ("archived", "deleted"):
                 can_be_closed = False
                 logger.info(
@@ -298,24 +322,54 @@ def check_disk_space(path: str) -> int:
 
 
 def check_shard_limit(
-    datastore: OpenSearchDataStore, threshold: float
+    datastore: OpenSearchDataStore, threshold: float, manual_limit: Optional[int] = None
 ) -> Tuple[bool, int, int]:
     """Verifies that the current shard count is within safe limits.
 
     Args:
         datastore (OpenSearchDataStore): OpenSearch data store instance.
         threshold (float): Percentage threshold of the shard limit.
+        manual_limit (int): Optional manual override for shards per node.
 
     Returns:
         Tuple[bool, int, int]: A tuple containing (is_safe, current_shards, limit).
     """
-    stats = datastore.client.cluster.stats()
+    stats = datastore.client.cluster.stats(request_timeout=10)
     current_shards = stats["indices"]["shards"]["total"]
-    try:
-        settings = datastore.client.cluster.get_settings(include_defaults=True)
-        limit_per_node = int(settings["defaults"]["cluster"]["max_shards_per_node"])
-    except Exception:
-        limit_per_node = 1000
+
+    if manual_limit:
+        limit_per_node = manual_limit
+    else:
+        try:
+            settings = datastore.client.cluster.get_settings(
+                include_defaults=True, request_timeout=10
+            )
+            # Try transient -> persistent -> defaults
+            limit_per_node = (
+                settings.get("transient", {})
+                .get("cluster", {})
+                .get("max_shards_per_node")
+            )
+            if limit_per_node is None:
+                limit_per_node = (
+                    settings.get("persistent", {})
+                    .get("cluster", {})
+                    .get("max_shards_per_node")
+                )
+            if limit_per_node is None:
+                limit_per_node = (
+                    settings.get("defaults", {})
+                    .get("cluster", {})
+                    .get("max_shards_per_node")
+                )
+
+            if limit_per_node is not None:
+                limit_per_node = int(limit_per_node)
+            else:
+                limit_per_node = 1000
+        except Exception:
+            limit_per_node = 1000
+
     total_limit = limit_per_node * stats["_nodes"]["total"]
     return current_shards < (total_limit * threshold), current_shards, total_limit
 
@@ -330,7 +384,7 @@ def check_jvm_pressure(datastore: OpenSearchDataStore, threshold: float) -> bool
     Returns:
         bool: True if heap usage is within safe limits, False otherwise.
     """
-    nodes_stats = datastore.client.nodes.stats(metric="jvm")
+    nodes_stats = datastore.client.nodes.stats(metric="jvm", request_timeout=10)
     for node_id, stats in nodes_stats["nodes"].items():
         heap_used = stats["jvm"]["mem"]["heap_used_percent"]
         if heap_used > (threshold * 100):
@@ -449,23 +503,31 @@ def wait_for_indices_ready(sketch_id: int, datastore: OpenSearchDataStore) -> bo
 
     start_time = time.time()
     while time.time() - start_time < UNARCHIVE_TIMEOUT:
-        cluster_health = datastore.client.cluster.health()
-        relocating = cluster_health.get("relocating_shards", 0)
-        if relocating > 10:
-            logger.info("  Cluster busy relocating (%d). Waiting...", relocating)
-        else:
-            all_ready = True
-            for index_name in all_indices:
-                try:
-                    health = datastore.client.cluster.health(index=index_name)
-                    if health["status"] == "red":
+        try:
+            # Increase timeout for health checks as cluster may be under load
+            cluster_health = datastore.client.cluster.health(request_timeout=10)
+            relocating = cluster_health.get("relocating_shards", 0)
+            if relocating > 10:
+                logger.info("  Cluster busy relocating (%d). Waiting...", relocating)
+            else:
+                all_ready = True
+                for index_name in all_indices:
+                    try:
+                        health = datastore.client.cluster.health(
+                            index=index_name, request_timeout=30
+                        )
+                        if health["status"] == "red":
+                            all_ready = False
+                            break
+                    except Exception:
                         all_ready = False
                         break
-                except Exception:
-                    all_ready = False
-                    break
-            if all_ready:
-                return True
+                if all_ready:
+                    return True
+        except Exception as e:
+            logger.warning("  Health check request timed out or failed: %s", str(e))
+            # Fall through to sleep and retry
+
         time.sleep(15)
     return False
 
@@ -512,6 +574,11 @@ def run_export() -> None:
     parser.add_argument(
         "--include-deleted", action="store_true", help="Include deleted sketches"
     )
+    parser.add_argument(
+        "--annotated-only",
+        action="store_true",
+        help="Export only events with annotations (labels, stars, comments)",
+    )
     parser.add_argument("--start-id", type=int, help="Process starting from this ID")
     parser.add_argument("--end-id", type=int, help="Process up to this ID")
     parser.add_argument("--limit", type=int, help="Limit number of sketches")
@@ -527,9 +594,32 @@ def run_export() -> None:
         default=MAX_SHARDS_THRESHOLD,
         help="Shard count threshold",
     )
+    parser.add_argument(
+        "--max-shards-per-node",
+        type=int,
+        help="Manual override for shards per node limit",
+    )
+    parser.add_argument(
+        "--ignore-shard-limit",
+        action="store_true",
+        help="Disable the shard limit safety check",
+    )
+    parser.add_argument(
+        "--ignore-cluster-checks",
+        action="store_true",
+        help="Disable JVM pressure, shard limit, and cluster health checks",
+    )
+    parser.add_argument(
+        "--ignore-index-wait",
+        action="store_true",
+        help="Skip waiting for OpenSearch indices to be ready after opening",
+    )
+    parser.add_argument(
+        "--log-file", help="Path to the log file"
+    )
     args = parser.parse_args()
 
-    setup_logging(args.export_dir)
+    setup_logging(args.export_dir, args.log_file)
     manifest_path = os.path.join(args.export_dir, "manifest.csv")
 
     datastore = OpenSearchDataStore()
@@ -579,6 +669,8 @@ def run_export() -> None:
     success_count = 0
     noop_count = 0
     total_bytes = 0
+    success_events = 0
+    success_timelines = 0
 
     logger.info("Instance Status:")
     logger.info("  Total sketches in database: %d", total_in_db)
@@ -639,25 +731,34 @@ def run_export() -> None:
                     clear_state(args.export_dir)
                     return
 
-            while not check_jvm_pressure(datastore, args.jvm_threshold):
-                logger.warning("JVM pressure high. Pausing...")
-                time.sleep(120)
+            if not args.ignore_cluster_checks:
+                while not check_jvm_pressure(datastore, args.jvm_threshold):
+                    logger.warning("JVM pressure high. Pausing...")
+                    time.sleep(120)
 
-            safe, current, limit = check_shard_limit(datastore, args.shard_threshold)
-            if not safe:
-                logger.warning(
-                    "Shard count too high (%d/%d). Pausing...", current, limit
-                )
-                time.sleep(300)
-                processed_count -= 1
-                continue
+                if not args.ignore_shard_limit:
+                    safe, current, limit = check_shard_limit(
+                        datastore, args.shard_threshold, args.max_shards_per_node
+                    )
+                    if not safe:
+                        logger.warning(
+                            "Shard count too high (%d/%d). Pausing...", current, limit
+                        )
+                        time.sleep(300)
+                        processed_count -= 1
+                        continue
 
-            if datastore.client.cluster.health()["status"] == "red":
-                logger.warning("Cluster status is RED. Pausing...")
-                time.sleep(300)
-                processed_count -= 1
-                continue
-
+                try:
+                    health = datastore.client.cluster.health(request_timeout=10)
+                    if health["status"] == "red":
+                        logger.warning("Cluster status is RED. Pausing...")
+                        time.sleep(300)
+                        processed_count -= 1
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        "Cluster health check failed: %s. Proceeding...", str(e)
+                    )
             try:
                 # Open indices directly
                 if original_sketch_status in ["archived", "deleted"]:
@@ -665,9 +766,11 @@ def run_export() -> None:
                     if not open_sketch_indices(sketch.id, datastore):
                         raise RuntimeError("Failed to open OpenSearch indices.")
 
-                    if not wait_for_indices_ready(sketch.id, datastore):
-                        raise TimeoutError("Indices failed to become ready.")
-
+                    if args.ignore_index_wait:
+                        logger.info("  Skipping readiness wait as requested.")
+                    else:
+                        if not wait_for_indices_ready(sketch.id, datastore):
+                            raise TimeoutError("Indices failed to become ready.")
                 # Check if there are actually any events to export
                 index_names = list(
                     {
@@ -676,7 +779,14 @@ def run_export() -> None:
                         if t.searchindex
                     }
                 )
-                total_events, _ = datastore.count(index_names)
+                try:
+                    total_events, _ = datastore.count(index_names)
+                except Exception as e:
+                    logger.warning(
+                        "  Unable to get event count for indices: %s", str(e)
+                    )
+                    total_events = 0
+
                 if total_events == 0:
                     error_msg = "Sketch indices are empty (0 events)."
                     export_status = "NOOP"
@@ -693,7 +803,11 @@ def run_export() -> None:
                         "--filename",
                         full_output_path,
                     ]
+                    if args.annotated_only:
+                        cmd.append("--annotated-only")
+
                     success, cmd_output = run_tsctl(cmd)
+
                     if not success:
                         error_msg = "tsctl export-sketch failed."
                     else:
@@ -726,6 +840,9 @@ def run_export() -> None:
         # Final Status Reporting
         if export_status == "Success":
             success_count += 1
+            success_events += total_events
+            success_timelines += len(index_names)
+
             msg = f"  Result: SUCCESS for Sketch {sketch.id}"
             click.echo(click.style(msg, fg="green", bold=True))
 
@@ -798,24 +915,34 @@ def run_export() -> None:
     summary_line = (
         f"Total: {total_target} | Processed: {processed_count} | "
         f"Success: {success_count} | NOOP: {noop_count} | "
-        f"Failed: {failed_count} | Volume: {total_bytes / (1024**3):.2f} GB"
+        f"Failed: {failed_count}"
+    )
+    detail_line = (
+        f"Volume: {total_bytes / (1024**3):.2f} GB | "
+        f"Events: {success_events:,} | Timelines: {success_timelines}"
     )
     click.echo(click.style("-" * 50, fg="white"))
     click.echo(click.style("BULK EXPORT SUMMARY", bold=True))
     summary_color = "green" if success_count == total_target else "yellow"
     click.echo(click.style(summary_line, fg=summary_color))
+    click.echo(click.style(detail_line, fg="cyan"))
     click.echo(click.style("-" * 50, fg="white"))
 
     logger.info("--------------------------------------------------")
     logger.info("BULK EXPORT SUMMARY")
     logger.info(
-        "Total: %d | Processed: %d | Success: %d | NOOP: %d | Failed: %d | Volume: %.2f GB",
+        "Total: %d | Processed: %d | Success: %d | NOOP: %d | Failed: %d",
         total_target,
         processed_count,
         success_count,
         noop_count,
         failed_count,
+    )
+    logger.info(
+        "Volume: %.2f GB | Events: %d | Timelines: %d",
         total_bytes / (1024**3),
+        success_events,
+        success_timelines,
     )
     logger.info("--------------------------------------------------")
 
