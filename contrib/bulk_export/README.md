@@ -8,7 +8,8 @@ A high-performance, resilient utility for exporting thousands of Timesketch sket
 - **Auto-Recovery**: Automatically handles cluster instability and Master node lag.
 - **Resource Guards**: Proactively monitors System RAM (OOM prevention) and OpenSearch JVM pressure.
 - **Fast Pathing**: Use `--open-indices-only` to export active data without Master node overhead.
-- **Audit Trails**: Every export includes a detailed performance breakdown and SHA256 integrity verification.
+- **Instant Shutdown**: Cleanly kills all child workers on `Ctrl+C` to prevent orphaned processes.
+- **Anti-Starvation**: Optimized producer loop ensures workers are never idle when ready sketches are available.
 
 ## 📋 Prerequisites
 
@@ -19,16 +20,18 @@ A high-performance, resilient utility for exporting thousands of Timesketch sket
 ## 🛠️ Usage
 
 ### The "Golden Path" (Fastest & Safest)
-Only export sketches that are already open in OpenSearch, skipping slow pre-counts:
+Only export sketches that are already open in OpenSearch, skipping slow pre-counts and Master node waits. This is the **strongly recommended** command for busy clusters:
 ```bash
 python3 bulk_export.py \
   --export-dir /mnt/sketch_export/annotated \
   --pipeline \
-  --concurrency 2 \
+  --concurrency 1 \
   --open-indices-only \
   --ignore-event-count \
-  --retry-failed
+  --retry-failed \
+  --min-ram-gb 25
 ```
+*(Note: You can safely increase `--concurrency` to 2 or more in this mode as it places zero pressure on the Master node.)*
 
 ### Full System Export
 Iterate through all sketches (including archived ones):
@@ -45,7 +48,7 @@ python3 bulk_export.py \
 
 ### Core Arguments
 - `--export-dir`: Destination for ZIP files and `manifest.csv`.
-- `--concurrency`: Number of parallel exports (Default: 1). **Recommended: 1-2 for high-shard clusters.**
+- `--concurrency`: Number of parallel exports (Default: 1).
 - `--pipeline`: Enable the producer/worker architecture (Highly recommended).
 - `--limit`: Stop after processing this many sketches.
 

@@ -289,6 +289,7 @@ def run_tsctl(command: List[str]) -> Tuple[bool, str]:
                 
                 clean_line = line.strip()
                 if clean_line:
+                    logger.info("      > %s", clean_line)
                     click.echo(f"      > {clean_line}")
                     combined_output.append(clean_line)
     except Exception as e:
@@ -700,6 +701,7 @@ class ExportOrchestrator:
 
         self.open_indices_count = 0
         self.lock = threading.Lock()
+        self.producer_done = False
 
         self.success_count = 0
         self.noop_count = 0
@@ -727,131 +729,152 @@ class ExportOrchestrator:
     def producer_thread(self):
         """Sequentially opens indices for sketches."""
         global is_shutting_down
-        while (not self.pending_queue.empty() or not self.instant_ready_queue.empty()) and not is_shutting_down:
-            
-            # 1. Exhaust instant_ready_queue first (fast path)
-            # This ensures already-open indices are exported before we put
-            # pressure on the Master node to open new ones.
-            while not self.instant_ready_queue.empty():
-                if self.open_indices_count >= self.args.concurrency:
-                    time.sleep(2)
+        try:
+            while (not self.pending_queue.empty() or not self.instant_ready_queue.empty()) and not is_shutting_down:
+                
+                # 1. Exhaust instant_ready_queue first (fast path)
+                # This ensures already-open indices are exported before we put
+                # pressure on the Master node to open new ones.
+                while not self.instant_ready_queue.empty():
+                    if self.open_indices_count >= self.args.concurrency:
+                        time.sleep(2)
+                        continue
+                    
+                    sketch_id = self.instant_ready_queue.get()
+                    logger.info("  Sketch %d (already open) -> READY", sketch_id)
+                    self.ready_queue.put(sketch_id)
+                    self.timings[sketch_id] = {"duration_open": 0.0}
+                    with self.lock:
+                        self.open_indices_count += 1
+
+                # 2. Check if we have anything else to do
+                if self.pending_queue.empty():
+                    break
+
+                # 3. Buffer control for Pending (Archived) sketches
+                # Only block if the ready_queue is sufficiently full to prevent worker starvation.
+                if self.ready_queue.qsize() >= (self.args.concurrency * 2):
+                    time.sleep(5)
                     continue
                 
-                sketch_id = self.instant_ready_queue.get()
-                logger.info("  Sketch %d (already open) -> READY", sketch_id)
-                self.ready_queue.put(sketch_id)
-                self.timings[sketch_id] = {"duration_open": 0.0}
-                with self.lock:
-                    self.open_indices_count += 1
-
-            # 2. Check if we have anything else to do
-            if self.pending_queue.empty():
-                break
-
-            # 3. Buffer control for Pending (Archived) sketches
-            # Only block if the ready_queue is sufficiently full to prevent worker starvation.
-            if self.ready_queue.qsize() >= (self.args.concurrency * 2):
-                time.sleep(5)
-                continue
-            
-            # If we are strictly opening archived ones, respect the concurrency limit
-            if self.open_indices_count >= self.args.concurrency and not self.args.open_indices_only:
-                time.sleep(5)
-                continue
-
-            # Resource Guards
-            for path in [self.args.export_dir, self.args.tmp_dir]:
-                if check_disk_space(path) < self.args.min_disk_gb:
-                    logger.critical("LOW DISK SPACE on %s. Stopping.", path)
-                    is_shutting_down = True
-                    return
-
-            # RAM Guard: Pause if system RAM is low
-            if check_system_memory() < self.args.min_ram_gb:
-                logger.warning(
-                    "LOW SYSTEM RAM (Below %d GB). Pausing metadata production...",
-                    self.args.min_ram_gb
-                )
-                time.sleep(30)
-                continue
-
-            if not self.args.ignore_cluster_checks:
-                if not check_jvm_pressure(self.datastore, self.args.jvm_threshold):
-                    logger.warning("JVM pressure high. Waiting...")
-                    time.sleep(60)
+                # If we are strictly opening archived ones, respect the concurrency limit
+                if self.open_indices_count >= self.args.concurrency and not self.args.open_indices_only:
+                    time.sleep(5)
                     continue
-                
-                is_ok, latency = check_master_latency(self.datastore, self.args.max_master_wait)
-                if not is_ok:
+
+                # Resource Guards
+                for path in [self.args.export_dir, self.args.tmp_dir]:
+                    if check_disk_space(path) < self.args.min_disk_gb:
+                        logger.critical("LOW DISK SPACE on %s. Stopping.", path)
+                        is_shutting_down = True
+                        return
+
+                # RAM Guard: Pause if system RAM is low
+                if check_system_memory() < self.args.min_ram_gb:
                     logger.warning(
-                        "Master node queue latency high (%d ms). Waiting...", 
-                        latency
+                        "LOW SYSTEM RAM (Below %d GB). Pausing metadata production...",
+                        self.args.min_ram_gb
                     )
                     time.sleep(30)
                     continue
 
-                safe, _, _ = check_shard_limit(
-                    self.datastore,
-                    self.args.shard_threshold,
-                    self.args.max_shards_per_node,
+                if not self.args.ignore_cluster_checks:
+                    if not check_jvm_pressure(self.datastore, self.args.jvm_threshold):
+                        logger.warning("JVM pressure high. Waiting...")
+                        time.sleep(60)
+                        continue
+                    
+                    is_ok, latency = check_master_latency(self.datastore, self.args.max_master_wait)
+                    if not is_ok:
+                        logger.warning(
+                            "Master node queue latency high (%d ms). Waiting...", 
+                            latency
+                        )
+                        time.sleep(30)
+                        continue
+
+                    safe, _, _ = check_shard_limit(
+                        self.datastore,
+                        self.args.shard_threshold,
+                        self.args.max_shards_per_node,
+                    )
+                    if not safe:
+                        logger.warning("Shard count high. Waiting...")
+                        time.sleep(60)
+                        continue
+
+                sketch_id = self.pending_queue.get()
+                sketch = Sketch.query.get(sketch_id)
+                status_obj = sketch.get_status
+                orig_status = status_obj.status if status_obj else "unknown"
+
+                # Check if we can skip before opening
+                output_path = os.path.join(
+                    self.args.export_dir, f"sketch_{sketch_id}.zip"
                 )
-                if not safe:
-                    logger.warning("Shard count high. Waiting...")
-                    time.sleep(60)
+                if (
+                    not self.args.force
+                    and os.path.exists(output_path)
+                    and zipfile.is_zipfile(output_path)
+                ):
+                    self.ready_queue.put(sketch_id)
                     continue
 
-            sketch_id = self.pending_queue.get()
-            sketch = Sketch.query.get(sketch_id)
-            status_obj = sketch.get_status
-            orig_status = status_obj.status if status_obj else "unknown"
+                start_open = time.time()
+                if orig_status != "ready":
+                    if not open_sketch_indices(sketch_id, self.datastore):
+                        logger.error("Failed to open indices for %d", sketch_id)
+                    else:
+                        if not self.args.ignore_index_wait:
+                            wait_for_indices_ready(sketch_id, self.datastore)
+                        with self.lock:
+                            self.open_indices_count += 1
 
-            # Check if we can skip before opening
-            output_path = os.path.join(
-                self.args.export_dir, f"sketch_{sketch_id}.zip"
-            )
-            if (
-                not self.args.force
-                and os.path.exists(output_path)
-                and zipfile.is_zipfile(output_path)
-            ):
+                self.timings[sketch_id] = {
+                    "duration_open": time.time() - start_open
+                }
                 self.ready_queue.put(sketch_id)
-                continue
-
-            start_open = time.time()
-            if orig_status != "ready":
-                if not open_sketch_indices(sketch_id, self.datastore):
-                    logger.error("Failed to open indices for %d", sketch_id)
-                else:
-                    if not self.args.ignore_index_wait:
-                        wait_for_indices_ready(sketch_id, self.datastore)
-                    with self.lock:
-                        self.open_indices_count += 1
-
-            self.timings[sketch_id] = {
-                "duration_open": time.time() - start_open
-            }
-            self.ready_queue.put(sketch_id)
+        finally:
+            self.producer_done = True
+            logger.info("Producer thread finished.")
 
     def worker_thread(self):
         """Parallel data extraction."""
         global is_shutting_down
-        while (
-            not self.pending_queue.empty() or not self.ready_queue.empty()
-        ) and not is_shutting_down:
+        logger.info("Worker thread starting...")
+        while not is_shutting_down:
             try:
-                # Safety check: Don't export if the cluster is RED
-                try:
-                    h = self.datastore.client.cluster.health(request_timeout=10)
-                    if h.get("status") == "red":
-                        logger.warning("Cluster RED. Workers pausing...")
-                        time.sleep(30)
-                        continue
-                except Exception:
-                    pass
-
-                sketch_id = self.ready_queue.get(timeout=5)
+                # Use a short timeout to allow checking shutdown flag
+                sketch_id = self.ready_queue.get(timeout=10)
             except queue.Empty:
-                continue
+                if not self.producer_done:
+                    # Producer is still working, just wait
+                    continue
+                else:
+                    # Everything is done
+                    break
+
+            # Heartbeat & Queue status
+            ready_count = self.ready_queue.qsize()
+            pending_count = self.pending_queue.qsize()
+            total_remaining = ready_count + pending_count
+            logger.info(
+                "Worker picked up Sketch %d. Queue Status: %d ready, %d pending (%d total remaining).",
+                sketch_id, ready_count, pending_count, total_remaining
+            )
+            
+            # Safety check: Don't export if the cluster is RED
+            # (Quick check, no timeout needed as producer manages health)
+            try:
+                h = self.datastore.client.cluster.health(request_timeout=5)
+                if h.get("status") == "red":
+                    logger.warning("Cluster RED. Worker for %d waiting...", sketch_id)
+                    time.sleep(30)
+                    self.ready_queue.put(sketch_id)
+                    continue
+            except Exception:
+                # If health check fails, proceed anyway - tsctl will handle it
+                pass
 
             res = process_sketch_wrapper(sketch_id, self.args, self.datastore)
 
@@ -917,14 +940,15 @@ class ExportOrchestrator:
     def cleaner_thread(self):
         """Sequentially closes indices."""
         global is_shutting_down
-        while (
-            not self.ready_queue.empty()
-            or not self.cleanup_queue.empty()
-            or not self.pending_queue.empty()
-        ) and not is_shutting_down:
+        logger.info("Cleaner thread starting...")
+        while not is_shutting_down:
             try:
                 sketch_id = self.cleanup_queue.get(timeout=5)
             except queue.Empty:
+                if self.producer_done and self.ready_queue.empty():
+                    # Check one last time if worker is finished with cleanup_queue
+                    if self.cleanup_queue.empty():
+                        break
                 continue
 
             sketch = Sketch.query.get(sketch_id)
@@ -947,10 +971,16 @@ class ExportOrchestrator:
 
             start_close = time.time()
             if orig_status != "ready":
+                logger.info(
+                    "  Closing indices for Sketch %d because database status is '%s'.",
+                    sketch_id, orig_status
+                )
                 close_sketch_indices(sketch_id, self.datastore)
-                with self.lock:
-                    self.open_indices_count -= 1
                 time.sleep(5)  # Settle cluster
+
+            # Always release the slot, even if we didn't close indices
+            with self.lock:
+                self.open_indices_count -= 1
 
             # Final timing log
             t = self.timings.get(sketch_id, {})
