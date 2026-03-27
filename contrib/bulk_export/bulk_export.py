@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -165,6 +166,16 @@ def open_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool:
             if h.get("status") == "red":
                 logger.warning("Cluster is RED. Aborting index open.")
                 return False
+            
+            unassigned = h.get("unassigned_shards", 0)
+            if unassigned > 10:
+                logger.warning(
+                    "Cluster in recovery (%d unassigned). Pausing open...",
+                    unassigned
+                )
+                time.sleep(60)
+                return False
+
             if h.get("number_of_pending_tasks", 0) > 2:
                 logger.info("Master node busy. Waiting before open...")
                 time.sleep(30)
@@ -303,6 +314,20 @@ def check_disk_space(path: str) -> int:
     return free // (2**30)
 
 
+def check_system_memory() -> int:
+    """Returns available system memory in GB from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if "MemAvailable" in line:
+                    # Line looks like: MemAvailable:   12345678 kB
+                    parts = line.split()
+                    return int(parts[1]) // (1024 * 1024)
+    except Exception:
+        return 999  # Fallback to safe value if we can't read
+    return 0
+
+
 def check_shard_limit(
     datastore: OpenSearchDataStore, threshold: float, manual_limit: Optional[int] = None
 ) -> Tuple[bool, int, int]:
@@ -362,6 +387,44 @@ def write_to_manifest(manifest_path: str, data: Dict[str, Any]) -> None:
         writer.writerow(data)
 
 
+def retry_failed(manifest_path: str, export_dir: str) -> None:
+    """Removes failed entries from manifest and deletes associated ZIPs."""
+    if not os.path.exists(manifest_path):
+        return
+
+    fieldnames = [
+        "sketch_id", "name", "status", "export_status", "error_msg",
+        "recommendation", "output_file", "size_bytes", "sha256"
+    ]
+    retry_ids = []
+    rows_to_keep = []
+
+    try:
+        with open(manifest_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("export_status") == "Failed":
+                    retry_ids.append(int(row["sketch_id"]))
+                    # Delete the ZIP if it exists
+                    out_file = row.get("output_file")
+                    if out_file:
+                        full_path = os.path.join(export_dir, out_file)
+                        if os.path.exists(full_path):
+                            logger.info("Deleting failed ZIP: %s", full_path)
+                            os.remove(full_path)
+                else:
+                    rows_to_keep.append(row)
+
+        if retry_ids:
+            logger.info("Removing %d failed entries from manifest...", len(retry_ids))
+            with open(manifest_path, mode="w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows_to_keep)
+    except Exception as e:
+        logger.error("Failed to clean manifest for retry: %s", e)
+
+
 def wait_for_indices_ready(sketch_id: int, datastore: OpenSearchDataStore) -> bool:
     """Waits for sketch shards to initialize with Master node protection.
 
@@ -388,13 +451,22 @@ def wait_for_indices_ready(sketch_id: int, datastore: OpenSearchDataStore) -> bo
             h_cluster = datastore.client.cluster.health(request_timeout=30)
             pending = h_cluster.get("number_of_pending_tasks", 0)
             status = h_cluster.get("status")
+            unassigned = h_cluster.get("unassigned_shards", 0)
 
             if status == "red":
                 logger.warning("Cluster is RED! Pausing all operations...")
                 time.sleep(60)
                 continue
 
-            if pending > 5:
+            if unassigned > 10:
+                logger.warning(
+                    "Cluster is in recovery (%d unassigned shards). Waiting...",
+                    unassigned,
+                )
+                time.sleep(60)
+                continue
+
+            if pending > 2:
                 logger.info(
                     "Master node busy (%d tasks). Waiting for queue...", pending
                 )
@@ -516,8 +588,10 @@ def process_sketch_wrapper(sketch_id: int, args: Any, datastore: OpenSearchDataS
             cmd.append("--annotated-only")
         if args.include_legacy:
             cmd.append("--include-legacy")
+        if args.ignore_event_count:
+            cmd.append("--ignore-event-count")
 
-        success, _ = run_tsctl(cmd)
+        success, output = run_tsctl(cmd)
         result["duration_export"] = time.time() - start_export
 
         if (
@@ -525,11 +599,16 @@ def process_sketch_wrapper(sketch_id: int, args: Any, datastore: OpenSearchDataS
             and os.path.exists(output_path)
             and zipfile.is_zipfile(output_path)
         ):
+            # Parse event count from output
+            event_match = re.search(r"Verification: (\d+) events", output)
+            events_found = int(event_match.group(1)) if event_match else 0
+
             result.update(
                 {
                     "export_status": "Success",
                     "sha256": get_file_sha256(output_path),
                     "size_bytes": os.path.getsize(output_path),
+                    "events": events_found,
                 }
             )
         else:
@@ -570,6 +649,7 @@ class ExportOrchestrator:
 
         self.pending_queue = queue.Queue()
         self.ready_queue = queue.Queue()
+        self.instant_ready_queue = queue.Queue()  # Buffer for already-open sketches
         self.cleanup_queue = queue.Queue()
 
         self.open_indices_count = 0
@@ -588,23 +668,37 @@ class ExportOrchestrator:
             indices = {
                 t.searchindex.index_name for t in s.timelines if t.searchindex
             }
-            # If all indices for this sketch are already open, go to READY
+            # If all indices for this sketch are already open, go to buffer
             if indices and indices.issubset(open_os_indices):
                 logger.info(
-                    "  Sketch %d indices are already open. Queueing for READY.",
+                    "  Sketch %d indices are already open. Buffering for READY.",
                     s.id,
                 )
-                self.ready_queue.put(s.id)
-                self.timings[s.id] = {"duration_open": 0.0}
-                with self.lock:
-                    self.open_indices_count += 1
+                self.instant_ready_queue.put(s.id)
             else:
                 self.pending_queue.put(s.id)
 
     def producer_thread(self):
         """Sequentially opens indices for sketches."""
         global is_shutting_down
-        while not self.pending_queue.empty() and not is_shutting_down:
+        while (not self.pending_queue.empty() or not self.instant_ready_queue.empty()) and not is_shutting_down:
+            
+            # 1. Feed from instant_ready_queue first (fast path)
+            while not self.instant_ready_queue.empty() and self.open_indices_count < self.args.concurrency:
+                sketch_id = self.instant_ready_queue.get()
+                logger.info("  Sketch %d (already open) -> READY", sketch_id)
+                self.ready_queue.put(sketch_id)
+                self.timings[sketch_id] = {"duration_open": 0.0}
+                with self.lock:
+                    self.open_indices_count += 1
+
+            if self.pending_queue.empty():
+                if not self.instant_ready_queue.empty():
+                    time.sleep(10)
+                    continue
+                else:
+                    break
+
             # Stricter buffer: only open indices for current concurrency
             # to prevent metadata piling on the Master node.
             if self.open_indices_count >= self.args.concurrency:
@@ -617,6 +711,15 @@ class ExportOrchestrator:
                     logger.critical("LOW DISK SPACE on %s. Stopping.", path)
                     is_shutting_down = True
                     return
+
+            # RAM Guard: Pause if system RAM is low
+            if check_system_memory() < self.args.min_ram_gb:
+                logger.warning(
+                    "LOW SYSTEM RAM (Below %d GB). Pausing metadata production...",
+                    self.args.min_ram_gb
+                )
+                time.sleep(30)
+                continue
 
             if not self.args.ignore_cluster_checks:
                 if not check_jvm_pressure(self.datastore, self.args.jvm_threshold):
@@ -673,6 +776,16 @@ class ExportOrchestrator:
             not self.pending_queue.empty() or not self.ready_queue.empty()
         ) and not is_shutting_down:
             try:
+                # Safety check: Don't export if the cluster is RED
+                try:
+                    h = self.datastore.client.cluster.health(request_timeout=10)
+                    if h.get("status") == "red":
+                        logger.warning("Cluster RED. Workers pausing...")
+                        time.sleep(30)
+                        continue
+                except Exception:
+                    pass
+
                 sketch_id = self.ready_queue.get(timeout=5)
             except queue.Empty:
                 continue
@@ -795,10 +908,16 @@ def run_export() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument(
+        "--retry-failed", action="store_true", help="Retry failed exports from manifest.csv"
+    )
+    parser.add_argument(
         "--pipeline", action="store_true", help="Enable Pipeline Architecture"
     )
     parser.add_argument(
         "--min-disk-gb", type=int, default=MIN_DISK_SPACE_GB
+    )
+    parser.add_argument(
+        "--min-ram-gb", type=int, default=10, help="Pause if available RAM is below this GB"
     )
     parser.add_argument(
         "--settle-delay", type=int, default=SETTLE_DELAY
@@ -825,11 +944,16 @@ def run_export() -> None:
     parser.add_argument("--ignore-shard-limit", action="store_true")
     parser.add_argument("--ignore-cluster-checks", action="store_true")
     parser.add_argument("--ignore-index-wait", action="store_true")
+    parser.add_argument("--ignore-event-count", action="store_true")
     parser.add_argument("--log-file")
     args = parser.parse_args()
 
     setup_logging(args.export_dir, args.log_file)
     manifest_path = os.path.join(args.export_dir, "manifest.csv")
+
+    if args.retry_failed:
+        retry_failed(manifest_path, args.export_dir)
+
     datastore = OpenSearchDataStore()
     recover_state(args.export_dir, datastore)
     signal.signal(signal.SIGINT, signal_handler)

@@ -58,12 +58,14 @@ The script supports several command-line arguments:
 - `--start-id`: Process sketches starting from this ID.
 - `--end-id`: Process sketches up to this ID.
 - `--limit`: Max number of sketches to process in this run.
+- `--retry-failed`: If set, the script will automatically remove entries from `manifest.csv` that are marked as `Failed` and delete their associated ZIP files, allowing them to be retried in the current run.
 - `--log-file`: Explicit path to the log file (Default: `bulk_export.log` in export directory).
 - `--jvm-threshold`: JVM heap usage threshold as a float (0.0-1.0, Default: 0.85).
 - `--shard-threshold`: Shard count threshold as a float (0.0-1.0, Default: 0.9).
 - `--max-shards-per-node`: Manual override for shards per node limit.
 - `--ignore-cluster-checks`: Disable JVM pressure, shard limit, and cluster health checks entirely.
 - `--ignore-index-wait`: Skip waiting for OpenSearch indices to be ready after opening (use with caution).
+- `--ignore-event-count`: Skip precise event counting and verification. This significantly speeds up the export process on large clusters by bypassing the pre-count and spot-check phases.
 
 ## Prerequisites (Critical)
 For this utility to function correctly in high-scale environments, you **must** apply the following patches to your Timesketch installation. These patches fix core library bugs related to missing indices and system-level search operations.
@@ -73,7 +75,10 @@ For this utility to function correctly in high-scale environments, you **must** 
 # 1. Patch OpenSearch library (Fixes search crashes for system tools)
 docker cp timesketch/lib/datastores/opensearch.py <CONTAINER>:/opt/venv/lib/python3.12/site-packages/timesketch/lib/datastores/opensearch.py
 
-# 2. Patch tsctl tool (Allows exporting archived sketches)
+# 2. Patch Story Fetcher library (Fixes 403 Forbidden on Story exports)
+docker cp timesketch/lib/stories/api_fetcher.py <CONTAINER>:/opt/venv/lib/python3.12/site-packages/timesketch/lib/stories/api_fetcher.py
+
+# 3. Patch tsctl tool (Allows exporting archived sketches and resilient stories)
 docker cp timesketch/tsctl.py <CONTAINER>:/usr/local/src/timesketch/timesketch/tsctl.py
 ```
 
@@ -129,10 +134,27 @@ cd /usr/local/src/timesketch
 python3 contrib/bulk_export/bulk_export.py --export-dir /path/to/exports
 ```
 
+### Running in the Background (tmux)
+For large-scale exports that take hours or days, it is highly recommended to run the script inside a `tmux` session to prevent the process from being killed if your SSH connection drops.
+
+1.  **Start a new named session**:
+    ```bash
+    tmux new -s timesketch-export
+    ```
+2.  **Run your export command**:
+    ```bash
+    python3 bulk_export.py --export-dir /mnt/sketch_export/ --pipeline --concurrency 4 --ignore-event-count
+    ```
+3.  **Detach from the session**: Press `Ctrl + B`, then `D`.
+4.  **Re-attach later**:
+    ```bash
+    tmux attach -t timesketch-export
+    ```
+
 ### Monitoring Progress
 The script provides detailed real-time logging. In **Pipeline Mode**, tasks are asynchronous, so IDs will finish out of order.
 
-- **Console**: Observe parallel `SUCCESS` messages and progress bars.
+- **Console**: Observe parallel `SUCCESS` messages and progress bars. All log lines are prefixed with `[Sketch {id}]` for easy identification in parallel runs.
 - **Manifest**: Watch the source of truth grow:
   ```bash
   tail -f /path/to/exports/manifest.csv
@@ -145,7 +167,14 @@ The script provides detailed real-time logging. In **Pipeline Mode**, tasks are 
 ### Handling Retries
 The script will **skip** any sketch ID that already exists in the `manifest.csv`. 
 
-To retry a specific sketch:
+#### Automated Retries (Recommended)
+Use the `--retry-failed` flag to automatically clear failed entries and retry them in a single run:
+```bash
+python3 bulk_export.py --retry-failed
+```
+
+#### Manual Retries
+To manually retry a specific sketch:
 1. Open `manifest.csv`.
 2. Delete the row corresponding to the `sketch_id`.
 3. Re-run the script.
