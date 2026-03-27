@@ -24,6 +24,7 @@ import time
 import zipfile
 import subprocess
 import datetime
+import gc
 import traceback
 import tempfile
 import shutil
@@ -57,6 +58,8 @@ from timesketch.api.v1 import utils as api_utils
 from timesketch.lib.datastores.opensearch import OpenSearchDataStore
 from timesketch.lib.stories import markdown as markdown_story_exporter
 from timesketch.lib.stories import api_fetcher as story_api_fetcher
+from timesketch.lib.stories import interface as story_interface
+from timesketch.lib.aggregators import manager as aggregator_manager
 
 from timesketch.lib.definitions import DEFAULT_SOURCE_FIELDS
 
@@ -128,50 +131,24 @@ def _get_open_indices(datastore: OpenSearchDataStore, indices: List[str]) -> Lis
     Returns:
         List of index names that are confirmed to be open.
     """
-    open_indices = []
     if not indices:
-        return open_indices
+        return []
 
-    # Use a chunked approach to avoid long URLs if there are many indices
-    chunk_size = 100
-    for i in range(0, len(indices), chunk_size):
-        chunk = indices[i : i + chunk_size]
-        try:
-            # cluster.state returns the state of the indices (open/close)
-            # in the 'metadata' section.
-            res = datastore.client.cluster.state(metric="metadata", index=chunk)
-            metadata = res.get("metadata", {}).get("indices", {})
-            for index_name in chunk:
-                state = metadata.get(index_name, {}).get("state")
-                if state == "open":
-                    open_indices.append(index_name)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning(
-                "Chunked index state check failed, falling back to one-by-one: %s",
-                str(e),
-            )
-            # If a chunk fails, we fall back to checking one by one
-            for index_name in chunk:
-                try:
-                    res = datastore.client.cluster.state(
-                        metric="metadata", index=index_name
-                    )
-                    state = (
-                        res.get("metadata", {})
-                        .get("indices", {})
-                        .get(index_name, {})
-                        .get("state")
-                    )
-                    if state == "open":
-                        open_indices.append(index_name)
-                except Exception as e_inner:  # pylint: disable=broad-except
-                    logger.debug(
-                        "One-by-one index check failed for %s: %s",
-                        index_name,
-                        str(e_inner),
-                    )
-                    continue
-    return open_indices
+    try:
+        # Use _cat/indices which is much faster than cluster.state for status checks
+        # and returns minimal data.
+        res = datastore.client.cat.indices(
+            index=indices, h="index,status", format="json"
+        )
+        return [item["index"] for item in res if item.get("status") == "open"]
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            "Fast index state check failed, falling back to permissive: %s",
+            str(e),
+        )
+        # Fallback: if we can't check, assume they might be open and let
+        # ignore_unavailable=True handle it in the subsequent queries.
+        return indices
 
 
 def _get_random_event_ids(
@@ -1164,6 +1141,134 @@ def print_table(table_data):
         print()
 
 
+@cli.command(name="list-orphaned-indices")
+@click.option("--close", is_flag=True, help="Actually close the orphaned indices.")
+def list_orphaned_indices(close: bool):
+    """Find archived sketches that still have open indices in OpenSearch.
+
+    This command identifies sketches marked as 'archived' in the database
+    but whose indices are still 'open' in OpenSearch, wasting shard slots.
+    """
+    datastore = OpenSearchDataStore()
+    
+    # 1. Get ALL open indices from OpenSearch
+    print("Fetching all open indices from OpenSearch...")
+    try:
+        res = datastore.client.cat.indices(h="index,status", format="json")
+        open_indices = {
+            item["index"] for item in res 
+            if item.get("status") == "open" 
+            and not item["index"].startswith(".")
+        }
+    except Exception as e:
+        print(f"ERROR: Could not query OpenSearch: {e}")
+        return
+
+    print(f"Found {len(open_indices)} open indices. Checking database status...")
+
+    # 2. Query DB for archived sketches and check their indices
+    orphaned_count = 0
+    archived_sketches = Sketch.query.filter(Sketch.status.any(status="archived")).all()
+    
+    for sketch in archived_sketches:
+        for timeline in sketch.timelines:
+            if not timeline.searchindex:
+                continue
+            
+            idx = timeline.searchindex.index_name
+            if idx in open_indices:
+                print(f"ORPHAN: Sketch {sketch.id:5} is ARCHIVED but Index {idx} is OPEN | Name: {sketch.name[:50]}")
+                orphaned_count += 1
+                
+                if close:
+                    try:
+                        datastore.client.indices.close(index=idx)
+                        print(f"       -> CLOSED orphaned index {idx}")
+                    except Exception as e:
+                        print(f"       -> FAILED to close index {idx}: {e}")
+
+    print("-" * 40)
+    print(f"Total orphaned open indices found: {orphaned_count}")
+    if not close:
+        print("Run with --close to actually close these indices.")
+
+
+@cli.command(name="list-stale-sketches")
+@click.option("--threshold", default=10, help="Document count threshold (inclusive).")
+@click.option("--close", is_flag=True, help="Actually close the indices in OpenSearch.")
+@click.option(
+    "--status",
+    multiple=True,
+    help="Filter by sketch status (e.g. archived, deleted). Can be used multiple times.",
+)
+def list_stale_sketches(threshold: int, close: bool, status: tuple):
+    """Find sketches with few or no documents in OpenSearch.
+
+    This command identifies sketches whose indices have a document count
+    less than or equal to the threshold. This is useful for identifying
+    failed imports or test sketches that are wasting shard slots.
+    """
+    datastore = OpenSearchDataStore()
+    
+    # 1. Get all open indices and their counts from OpenSearch
+    print(f"Fetching indices with <= {threshold} documents from OpenSearch...")
+    try:
+        # Using cat indices for speed
+        res = datastore.client.cat.indices(h="index,status,docs.count", format="json")
+        stale_indices = {
+            item["index"]: int(item["docs.count"]) 
+            for item in res 
+            if item.get("status") == "open" 
+            and item.get("docs.count") is not None
+            and int(item["docs.count"]) <= threshold
+            and not item["index"].startswith(".")
+        }
+    except Exception as e:
+        print(f"ERROR: Could not query OpenSearch: {e}")
+        return
+
+    if not stale_indices:
+        print("No stale indices found.")
+        return
+
+    print(f"Found {len(stale_indices)} indices matching criteria. Mapping to sketches...")
+
+    # 2. Map indices to sketches in the database
+    found_count = 0
+    for index_name, doc_count in stale_indices.items():
+        si = SearchIndex.query.filter_by(index_name=index_name).first()
+        if not si:
+            continue
+        
+        # An index can belong to multiple timelines, find the sketches
+        for timeline in si.timelines:
+            sketch = timeline.sketch
+            if not sketch:
+                continue
+            
+            s_status = sketch.get_status.status
+            if status and s_status not in status:
+                continue
+
+            print(
+                f"Sketch {sketch.id:5} | Status: {s_status:10} | Docs: {doc_count:4} | "
+                f"Index: {index_name} | Name: {sketch.name[:50]}"
+            )
+            found_count += 1
+            
+            if close:
+                try:
+                    datastore.client.indices.close(index=index_name)
+                    print(f"      -> CLOSED index {index_name}")
+                except Exception as e:
+                    print(f"      -> FAILED to close index {index_name}: {e}")
+
+    print("-" * 40)
+    print(f"Total stale sketch relationships found: {found_count}")
+    if not close:
+        print("Run with --close to actually close these indices.")
+
+
 @cli.command(name="sketch-info")
 @click.argument("sketch_id", type=int)
 def sketch_info(sketch_id: int):
@@ -1235,7 +1340,7 @@ def sketch_info(sketch_id: int):
                 t.created_at,
                 t.user_id,
                 t.description,
-                t.status[-1].status,
+                t.get_status.status,
             ]
         )
     print_table(timeline_table_data)
@@ -2843,41 +2948,52 @@ def _get_sketch_metadata(sketch: Sketch) -> dict:
     # Timelines
     timelines = list(sketch.timelines)
     if timelines:
-        print(f"  Processing {len(timelines)} timeline(s)...")
+        print(f"  [Sketch {sketch.id}] Processing {len(timelines)} timeline(s)...")
         for timeline in timelines:
             marshalled_timeline = marshal(timeline, schemas["timeline"])
             metadata["timelines"].append(marshalled_timeline)
+        del timelines
+        gc.collect()
 
     # Views
     named_views = sketch.get_named_views
     if named_views:
-        print(f"  Processing {len(named_views)} saved view(s)...")
+        print(f"  [Sketch {sketch.id}] Processing {len(named_views)} saved view(s)...")
         for view in named_views:
             marshalled_view = marshal(view, schemas["view"])
             metadata["views"].append(marshalled_view)
+        del named_views
+        gc.collect()
 
     # Stories
     stories = list(sketch.stories)
     if stories:
-        print(f"  Processing {len(stories)} story(ies)...")
+        print(f"  [Sketch {sketch.id}] Processing {len(stories)} story(ies)...")
         for story in stories:
             marshalled_story = marshal(story, schemas["story"])
             metadata["stories"].append(marshalled_story)
+        del stories
+        gc.collect()
     else:
-        print("  No stories found for this sketch.")
+        print(f"  [Sketch {sketch.id}] No stories found for this sketch.")
 
     # Aggregations
     aggregations = list(sketch.aggregations)
     if aggregations:
-        print(f"  Processing {len(aggregations)} aggregation(s)...")
+        print(f"  [Sketch {sketch.id}] Processing {len(aggregations)} aggregation(s)...")
         for agg in aggregations:
             marshalled_agg = marshal(agg, schemas["aggregation"])
             metadata["aggregations"].append(marshalled_agg)
+        del aggregations
+        gc.collect()
 
     # Aggregation Groups
     aggregation_groups = list(sketch.aggregationgroups)
     if aggregation_groups:
-        print(f"  Processing {len(aggregation_groups)} aggregation group(s)...")
+        print(
+            f"  [Sketch {sketch.id}] Processing {len(aggregation_groups)} "
+            "aggregation group(s)..."
+        )
         for group in aggregation_groups:
             marshalled_group = marshal(group, schemas["aggregationgroup"])
             metadata["aggregation_groups"].append(marshalled_group)
@@ -2885,40 +3001,51 @@ def _get_sketch_metadata(sketch: Sketch) -> dict:
     # Graphs
     graphs = list(sketch.graphs)
     if graphs:
-        print(f"  Processing {len(graphs)} saved graph(s)...")
+        print(f"  [Sketch {sketch.id}] Processing {len(graphs)} saved graph(s)...")
         for graph in graphs:
             marshalled_graph = marshal(graph, schemas["graph"])
             metadata["graphs"].append(marshalled_graph)
 
     # Comments
-    # Fetch Event DB objects that are part of the sketch and have comments.
-    results = Event.get_with_comments(sketch=sketch)
-    events_with_comments_list = results.all() if hasattr(results, "all") else results
+    # Fetch comments directly via join to avoid loading massive Event objects into RAM
+    # This was a major source of 50GB+ memory spikes in large sketches.
+    comments_query = (
+        db_session.query(
+            Comment.comment,
+            Comment.created_at,
+            Comment.updated_at,
+            User.username,
+            Event.id.label("event_id"),
+            Event.document_id.label("event_uuid")
+        )
+        .join(Event, Comment.commentable_id == Event.id)
+        .join(User, Comment.user_id == User.id)
+        .filter(Comment.commentable_type == "event")
+        .filter(Event.sketch_id == sketch.id)
+    )
 
-    if events_with_comments_list:
-        print(f"  Processing comments for {len(events_with_comments_list)} event(s)...")
-        for db_event_with_comment in events_with_comments_list:
-            for comment_obj in db_event_with_comment.comments:
-                metadata["comments"].append(
-                    {
-                        "id": comment_obj.id,  # Comment's own SQL PK
-                        "comment": comment_obj.comment,
-                        "user": (
-                            comment_obj.user.username if comment_obj.user else None
-                        ),
-                        "created_at": _isoformat_or_none(comment_obj.created_at),
-                        "updated_at": _isoformat_or_none(comment_obj.updated_at),
-                        # SQL PK of the Event object
-                        "event_id": db_event_with_comment.id,
-                        # OpenSearch _id
-                        "event_uuid": db_event_with_comment.document_id,
-                    }
-                )
+    all_comments = comments_query.all()
+
+    if all_comments:
+        print(f"  [Sketch {sketch.id}] Processing {len(all_comments)} event comment(s)...")
+        for c in all_comments:
+            metadata["comments"].append(
+                {
+                    "comment": c.comment,
+                    "user": c.username,
+                    "created_at": _isoformat_or_none(c.created_at),
+                    "updated_at": _isoformat_or_none(c.updated_at),
+                    "event_id": c.event_id,
+                    "event_uuid": c.event_uuid,
+                }
+            )
+        del all_comments
+        gc.collect()
     else:
-        print("  No events with comments found for this sketch.")
+        print(f"  [Sketch {sketch.id}] No events with comments found for this sketch.")
 
     # Analysis Sessions (and their analyses)
-    print("  Processing analysis sessions...")
+    print(f"  [Sketch {sketch.id}] Processing analysis sessions...")
     analysis_sessions = (
         AnalysisSession.query.join(Analysis)
         .join(Timeline)
@@ -2930,11 +3057,13 @@ def _get_sketch_metadata(sketch: Sketch) -> dict:
         metadata["analysis_sessions"].append(
             marshal(session, schemas["analysissession"])
         )
+    del analysis_sessions
+    gc.collect()
 
     # DFIQ Scenarios (and their nested facets, questions, etc.)
     scenarios = list(sketch.scenarios)
     if scenarios:
-        print(f"  Processing {len(scenarios)} DFIQ scenario(s)...")
+        print(f"  [Sketch {sketch.id}] Processing {len(scenarios)} DFIQ scenario(s)...")
         for scenario in scenarios:
             metadata["scenarios"].append(marshal(scenario, schemas["scenario"]))
 
@@ -2943,7 +3072,7 @@ def _get_sketch_metadata(sketch: Sketch) -> dict:
 
 # Helper function to fetch and prepare event data
 def _calculate_export_counts(
-    sketch: Sketch,
+    sketch_id: int,
     datastore: OpenSearchDataStore,
     active_indices: List[str],
     active_tids: List[int],
@@ -2954,7 +3083,7 @@ def _calculate_export_counts(
     """Calculates expected event counts for the export.
 
     Args:
-        sketch: The Sketch database model.
+        sketch_id: The ID of the sketch.
         datastore: OpenSearchDataStore instance.
         active_indices: List of index names.
         active_tids: List of timeline IDs.
@@ -2972,97 +3101,97 @@ def _calculate_export_counts(
     legacy_count = 0
     verification_query_dsl = None
 
-    # Filter out closed indices to avoid errors
-    open_indices = _get_open_indices(datastore, active_indices)
-
-    if not open_indices:
-        print("    Note: No open indices to count.")
+    if not active_indices:
+        print(f"    [Sketch {sketch_id}] Note: No open indices to count.")
         return 0, 0, None
 
-    # Count modern events
-    for tid in active_tids:
-        query_dsl = {"query": {"bool": {"must": [{"term": {"__ts_timeline_id": tid}}]}}}
-        if annotation_filter:
-            query_dsl["query"]["bool"]["must"].append(annotation_filter)
+    # 1. Build a unified query to get everything in one request
+    # This reduces Master node pressure by avoiding multiple count calls
+    combined_query = {"query": {"bool": {"should": [], "minimum_should_match": 1}}}
 
-        if not verification_query_dsl:
-            verification_query_dsl = query_dsl
+    # Modern events filter
+    if active_tids:
+        modern_filter = {"terms": {"__ts_timeline_id": active_tids}}
+        combined_query["query"]["bool"]["should"].append(modern_filter)
 
-        count = datastore.search(
-            sketch_id=sketch.id,
-            indices=open_indices,
-            query_dsl=query_dsl,
-            count=True,
-        )
-        total_expected += count
+    # Legacy events filter (always built to get accurate legacy count via agg)
+    legacy_filter = {
+        "bool": {"must_not": [{"exists": {"field": "__ts_timeline_id"}}]}
+    }
+    if include_legacy:
+        combined_query["query"]["bool"]["should"].append(legacy_filter)
 
-    # Count legacy events (missing __ts_timeline_id)
-    legacy_query = {
-        "query": {"bool": {"must_not": [{"exists": {"field": "__ts_timeline_id"}}]}}
+    # Global annotation filter (if requested)
+    if annotation_filter:
+        combined_query["query"] = {
+            "bool": {"must": [annotation_filter, combined_query["query"]]}
+        }
+
+    # Use aggregations to get specific counts for legacy events in the same call
+    combined_query["aggs"] = {
+        "legacy_events": {"filter": legacy_filter}
     }
     if annotation_filter:
-        legacy_query["query"]["bool"]["must"] = [annotation_filter]
+        # If we have an annotation filter, the aggregation filter must include it
+        combined_query["aggs"]["legacy_events"]["filter"] = {
+            "bool": {"must": [annotation_filter, legacy_filter]}
+        }
 
-    for index_name in open_indices:
-        try:
-            c_res = datastore.client.count(index=index_name, body=legacy_query)
-            legacy_count += c_res.get("count", 0)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning(
-                "Could not count events for index %s: %s. "
-                "This might lead to a mismatch in the total event count.",
-                index_name,
-                str(e),
-            )
+    try:
+        # Use search with size: 0 and ignore_unavailable=True
+        res = datastore.client.search(
+            index=active_indices,
+            body=combined_query,
+            size=0,
+            params={"ignore_unavailable": "true"},
+            request_timeout=120, # Increased timeout for large clusters
+        )
+        
+        # Get total matches for the primary query (Total Expected)
+        total_hits = res["hits"]["total"]
+        total_expected = total_hits.get("value", 0) if isinstance(total_hits, dict) else total_hits
+        
+        # Get legacy count from aggregations
+        legacy_count = res.get("aggregations", {}).get("legacy_events", {}).get("doc_count", 0)
 
-    if method == "direct":
-        if include_legacy:
-            total_expected += legacy_count
-        elif legacy_count > 0:
-            click.echo(
-                click.style(
-                    f"\nNOTE: Found {legacy_count:,} legacy events "
-                    "(missing __ts_timeline_id). These will be SKIPPED. "
-                    "Use --include-legacy to include them.\n",
-                    fg="cyan",
-                ),
-                err=True,
-            )
-    else:
-        # API method always returns legacy events if present
-        total_expected += legacy_count
-        if legacy_count > 0 and verification_query_dsl:
-            should_clause = verification_query_dsl["query"]["bool"]["must"][0]
-            verification_query_dsl["query"]["bool"]["must"] = [
-                {
-                    "bool": {
-                        "should": [
-                            should_clause,
-                            {
-                                "bool": {
-                                    "must_not": {
-                                        "exists": {"field": "__ts_timeline_id"}
-                                    }
-                                }
-                            },
-                        ]
-                    }
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error("[Sketch %d] Failed to calculate export counts: %s", sketch_id, str(e))
+        return 0, 0, None
+
+    # 2. Build verification query for spot check (uses first TID for speed)
+    if active_tids:
+        verification_query_dsl = {
+            "query": {
+                "bool": {
+                    "must": [{"term": {"__ts_timeline_id": active_tids[0]}}]
                 }
-            ]
-            if annotation_filter:
-                verification_query_dsl["query"]["bool"]["must"].append(
-                    annotation_filter
-                )
+            }
+        }
+        if annotation_filter:
+            verification_query_dsl["query"]["bool"]["must"].append(annotation_filter)
+
+    # 3. Handle legacy warning for direct method
+    if method == "direct" and not include_legacy and legacy_count > 0:
+        click.echo(
+            click.style(
+                f"\n[Sketch {sketch_id}] NOTE: Found {legacy_count:,} legacy events "
+                "(missing __ts_timeline_id). These will be SKIPPED. "
+                "Use --include-legacy to include them.\n",
+                fg="cyan",
+            ),
+            err=True,
+        )
 
     return total_expected, legacy_count, verification_query_dsl
 
 
 def _export_index_mappings(
-    datastore: OpenSearchDataStore, active_indices: List[str], target_dir: str
+    sketch_id: int, datastore: OpenSearchDataStore, active_indices: List[str], target_dir: str
 ) -> None:
     """Collect index mappings and save as JSON files.
 
     Args:
+        sketch_id: The ID of the sketch.
         datastore: OpenSearchDataStore instance.
         active_indices: List of index names to fetch mappings for.
         target_dir: Base directory for export files.
@@ -3071,14 +3200,17 @@ def _export_index_mappings(
     try:
         os.makedirs(mappings_dir, exist_ok=True)
     except OSError as e:
-        click.echo(f"  Warning: Could not create mappings directory: {e!s}", err=True)
+        click.echo(
+            f"  [Sketch {sketch_id}] Warning: Could not create mappings directory: {e!s}",
+            err=True,
+        )
         return
 
     open_indices = _get_open_indices(datastore, active_indices)
 
     for index_name in active_indices:
         if index_name not in open_indices:
-            print(f"    Note: Index {index_name} is closed, skipping mapping.")
+            print(f"    [Sketch {sketch_id}] Note: Index {index_name} is closed, skipping mapping.")
             continue
         try:
             mapping = datastore.client.indices.get_mapping(index=index_name)
@@ -3086,9 +3218,182 @@ def _export_index_mappings(
             with open(m_path, "w", encoding="utf-8") as f_map:
                 json.dump(mapping, f_map, indent=2)
         except (IOError, OSError) as e:
-            click.echo(f"    WARNING: Failed to save mapping for {index_name}: {e!s}")
+            click.echo(f"    [Sketch {sketch_id}] WARNING: Failed to save mapping for {index_name}: {e!s}")
         except Exception as e:  # pylint: disable=broad-except
-            click.echo(f"    WARNING: Mapping retrieval failed for {index_name}: {e!s}")
+            click.echo(f"    [Sketch {sketch_id}] WARNING: Mapping retrieval failed for {index_name}: {e!s}")
+
+
+class DbDataFetcher(story_interface.DataFetcher):
+    """Data Fetcher that uses direct DB access and bypasses ACL."""
+
+    def __init__(self):
+        """Initialize the data fetcher."""
+        super().__init__()
+        self._datastore = OpenSearchDataStore()
+
+    def get_indices_and_timelines(self, index_list):
+        """Returns a tuple with two lists from indices and timeline IDs.
+
+        Args:
+            index_list (list): A list of indices or timeline IDs.
+
+        Returns:
+            tuple: A tuple containing a list of index names (str) and
+                a list of timeline IDs (int).
+        """
+        indices = []
+        timeline_ids = []
+
+        if isinstance(index_list, str):
+            index_list = index_list.split(",")
+
+        if not index_list:
+            return indices, timeline_ids
+
+        for index in index_list:
+            if isinstance(index, str):
+                indices.append(index)
+            if isinstance(index, int):
+                timeline_ids.append(index)
+
+        return indices, timeline_ids
+
+    def get_aggregation(self, agg_dict):
+        """Returns an aggregation object from an aggregation dict.
+
+        Args:
+            agg_dict (dict): A dictionary containing information
+                about the stored aggregation.
+
+        Returns:
+            dict: A dictionary with metadata information and the
+                aggregation result object.
+        """
+        aggregation_id = agg_dict.get("id")
+        if not aggregation_id:
+            return {}
+
+        aggregation = Aggregation.query.get(aggregation_id)
+        if not aggregation:
+            return {}
+
+        try:
+            agg_class = aggregator_manager.AggregatorManager.get_aggregator(
+                aggregation.agg_type
+            )
+        except KeyError:
+            return {}
+
+        if not agg_class:
+            return {}
+
+        parameter_string = aggregation.parameters
+        parameters = json.loads(parameter_string)
+        parameter_index = parameters.pop("index", None)
+        indices, timeline_ids = self.get_indices_and_timelines(parameter_index)
+        aggregator = agg_class(
+            sketch_id=self._sketch_id, indices=indices, timeline_ids=timeline_ids
+        )
+
+        _ = parameters.pop("supported_charts", None)
+        chart_color = parameters.pop("chart_color", "N/A")
+        chart_title = parameters.pop("chart_title", "N/A")
+
+        data = {
+            "aggregation": aggregator.run(**parameters),
+            "name": aggregation.name,
+            "description": aggregation.description,
+            "agg_type": aggregation.agg_type,
+            "parameters": parameters,
+            "chart_type": aggregation.chart_type,
+            "chart_title": chart_title,
+            "chart_color": chart_color,
+            "user": aggregation.user,
+        }
+        return data
+
+    def get_aggregation_group(self, agg_dict):
+        """Returns an aggregation group dict.
+
+        Args:
+            agg_dict (dict): A dictionary containing information
+                about the stored aggregation group.
+
+        Returns:
+            dict: A dictionary containing metadata about the
+                aggregation group.
+        """
+        group_id = agg_dict.get("id")
+        if not group_id:
+            return None
+
+        group = AggregationGroup.query.get(group_id)
+        if not group:
+            return None
+
+        # Return minimal dict as charts are not yet supported in markdown export
+        return {
+            "name": group.name,
+            "description": group.description,
+            "chart": None,
+            "parameters": group.parameters,
+            "orientation": group.orientation,
+            "user": group.user,
+        }
+
+    def get_view(self, view_dict):
+        """Returns a data frame from a view dict.
+
+        Args:
+            view_dict (dict): A dictionary containing information
+                about the stored view.
+
+        Returns:
+            pd.DataFrame: A pandas DataFrame with the results from the view.
+        """
+        view_id = view_dict.get("id")
+        if not view_id:
+            return pd.DataFrame()
+
+        view = View.query.get(view_id)
+        if not view:
+            return pd.DataFrame()
+
+        if not view.query_string and not view.query_dsl:
+            return pd.DataFrame()
+
+        query_filter = view.query_filter
+        if query_filter and isinstance(query_filter, str):
+            query_filter = json.loads(query_filter)
+        elif not query_filter:
+            query_filter = {"indices": "_all", "size": 100}
+
+        if view.query_dsl:
+            query_dsl = json.loads(view.query_dsl)
+        else:
+            query_dsl = None
+
+        # Direct DB query instead of get_with_acl
+        sketch = Sketch.query.get(self._sketch_id)
+        if not sketch:
+            return pd.DataFrame()
+
+        sketch_indices = [
+            t.searchindex.index_name for t in sketch.timelines if t.searchindex
+        ]
+
+        results = self._datastore.search_stream(
+            sketch_id=self._sketch_id,
+            query_string=view.query_string,
+            query_filter=query_filter,
+            query_dsl=query_dsl,
+            indices=sketch_indices,
+        )
+        if results is None:
+            return pd.DataFrame()
+
+        result_list = [x.get("_source") for x in results]
+        return pd.DataFrame(result_list)
 
 
 def _export_stories_to_markdown(sketch: Sketch, target_dir: str) -> None:
@@ -3102,7 +3407,10 @@ def _export_stories_to_markdown(sketch: Sketch, target_dir: str) -> None:
     try:
         os.makedirs(stories_dir, exist_ok=True)
     except OSError as e:
-        click.echo(f"  Warning: Could not create stories directory: {e!s}", err=True)
+        click.echo(
+            f"  [Sketch {sketch.id}] Warning: Could not create stories directory: {e!s}",
+            err=True,
+        )
         return
 
     for story in sketch.stories:
@@ -3117,15 +3425,15 @@ def _export_stories_to_markdown(sketch: Sketch, target_dir: str) -> None:
         # Handle newer block-based stories (JSON) vs legacy (raw Markdown)
         if story_content.startswith("["):
             try:
-                data_fetcher = story_api_fetcher.ApiDataFetcher()
+                data_fetcher = DbDataFetcher()
                 data_fetcher.set_sketch_id(sketch.id)
                 with markdown_story_exporter.MarkdownStoryExporter() as exporter:
                     exporter.set_data_fetcher(data_fetcher)
                     exporter.from_string(story_content)
                     story_content = exporter.export_story()
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
+            except Exception as e:
                 click.echo(
-                    f"  Warning: Failed to parse block-based story {story.id}: "
+                    f"  [Sketch {sketch.id}] Warning: Failed to process story {story.id}: "
                     f"{e!s}. Exporting raw content.",
                     err=True,
                 )
@@ -3362,6 +3670,12 @@ def _fetch_and_prepare_event_data(
         "as it may cause data leakage in shared-index environments."
     ),
 )
+@click.option(
+    "--ignore-event-count",
+    is_flag=True,
+    default=False,
+    help="Skip precise event counting and verification for speed.",
+)
 def export_sketch(
     sketch_id: int,
     output_format: str,
@@ -3370,6 +3684,7 @@ def export_sketch(
     default_fields: bool,
     annotated_only: bool,
     include_legacy: bool,
+    ignore_event_count: bool,
 ) -> None:
     """Exports a Timesketch sketch to a forensic-grade zip archive.
 
@@ -3385,26 +3700,37 @@ def export_sketch(
 
     if sketch.get_status.status == "archived":
         print(
-            f"ERROR: Sketch {sketch_id} is archived. "
-            "Please unarchive it before exporting."
+            f"Note: Sketch {sketch_id} is archived in the database. "
+            "Proceeding with export using all timelines."
         )
-        return
 
-    active_indices = list({t.searchindex.index_name for t in sketch.active_timelines})
-    active_tids = [t.id for t in sketch.active_timelines]
+    # Use all timelines for export, not just active ones, to support
+    # exporting archived sketches whose indices have been manually opened.
+    all_indices = list(
+        {t.searchindex.index_name for t in sketch.timelines if t.searchindex}
+    )
+    all_tids = [t.id for t in sketch.timelines]
 
     # Filter out closed indices to avoid errors
     datastore = OpenSearchDataStore()
-    open_indices = _get_open_indices(datastore, active_indices)
+    open_indices = _get_open_indices(datastore, all_indices)
 
     if not open_indices:
-        print(f"ERROR: No open indices found for sketch {sketch_id}.")
-        if active_indices:
-            print(f"  Total indices in sketch: {', '.join(active_indices)}")
-            print("  Note: All indices appear to be CLOSED or MISSING in OpenSearch.")
+        print(f"[Sketch {sketch_id}] ERROR: No open indices found.")
+        if all_indices:
+            print(f"  [Sketch {sketch_id}] Total indices in sketch: {', '.join(all_indices)}")
+            print(f"  [Sketch {sketch_id}] Note: All indices appear to be CLOSED or MISSING in OpenSearch.")
         else:
-            print("  Note: This sketch has no timelines associated with it.")
+            print(f"  [Sketch {sketch_id}] Note: This sketch has no timelines associated with it.")
         return
+
+    # Filter timelines to only include those with open indices
+    active_timelines = [
+        t for t in sketch.timelines 
+        if t.searchindex and t.searchindex.index_name in open_indices
+    ]
+    active_indices = open_indices
+    active_tids = [t.id for t in active_timelines]
 
     if method == "direct":
         # Check for shared indices to warn about potential data leakage
@@ -3438,7 +3764,7 @@ def export_sketch(
             )
 
     if method == "direct" and output_format == "csv":
-        print("  Note: 'direct' method only supports JSONL. Switching format...")
+        print(f"  [Sketch {sketch_id}] Note: 'direct' method only supports JSONL. Switching format...")
         output_format = "jsonl"
 
     if not filename:
@@ -3447,7 +3773,7 @@ def export_sketch(
     if not filename.lower().endswith(".zip"):
         filename += ".zip"
     if os.path.exists(filename):
-        print(f"ERROR: File '{filename}' already exists.")
+        print(f"[Sketch {sketch_id}] ERROR: File '{filename}' already exists.")
         return
 
     print(
@@ -3458,7 +3784,7 @@ def export_sketch(
     # --- Add prominent warning to console output ---
     click.echo(
         click.style(
-            "\nWARNING: There is currently no native method to re-import "
+            f"\n[Sketch {sketch_id}] WARNING: There is currently no native method to re-import "
             "this exported archive back into Timesketch.\n",
             fg="yellow",
             bold=True,
@@ -3508,23 +3834,26 @@ def export_sketch(
             }
 
         # 3. Precise Count
-        print("  Calculating exact event count...")
         total_expected = 0
         verification_query_dsl = None
         return_fields_to_fetch = DEFAULT_SOURCE_FIELDS if default_fields else None
 
         if open_indices:
-            total_expected, _, verification_query_dsl = _calculate_export_counts(
-                sketch,
-                datastore,
-                active_indices,
-                active_tids,
-                method,
-                include_legacy,
-                annotation_filter,
-            )
+            if ignore_event_count:
+                print(f"  [Sketch {sketch_id}] Skipping precise count as requested.")
+            else:
+                print(f"  [Sketch {sketch_id}] Calculating exact event count...")
+                total_expected, _, verification_query_dsl = _calculate_export_counts(
+                    sketch_id,
+                    datastore,
+                    active_indices,
+                    active_tids,
+                    method,
+                    include_legacy,
+                    annotation_filter,
+                )
         else:
-            print("  Exporting all event fields.")
+            print(f"  [Sketch {sketch_id}] Exporting all event fields.")
             return_fields_to_fetch = None  # Pass None to get all fields
 
         data_handle, _, _ = _fetch_and_prepare_event_data(
@@ -3532,17 +3861,21 @@ def export_sketch(
         )
 
         # 4. Stream Events & Hash simultaneously
-        print(f"  Streaming events to {event_filename}...")
+        print(f"  [Sketch {sketch_id}] Streaming events to {event_filename}...")
         event_hash_obj = hashlib.sha256()
         actual_row_count = 0
 
+        # Adjust progress bar if count was skipped
+        pg_total = total_expected if total_expected > 0 else None
+        pg_label = f"  [Sketch {sketch_id}] Export Progress"
+
         with open(tmp_event_file, "w", encoding="utf-8") as f_out:
             with click.progressbar(
-                length=total_expected,
-                label="  Export Progress",
+                length=pg_total,
+                label=pg_label,
                 show_pos=True,
-                show_percent=True,
-                show_eta=True,
+                show_percent=True if pg_total else False,
+                show_eta=True if pg_total else False,
             ) as progress_bar:
 
                 if method == "direct":
@@ -3580,7 +3913,7 @@ def export_sketch(
                             if actual_row_count % 10000 == 0:
                                 progress_bar.update(10000)
                     else:
-                        print("    Note: No open indices to stream events from.")
+                        print(f"    [Sketch {sketch_id}] Note: No open indices to stream events from.")
                 else:
                     if open_indices:
                         fields = DEFAULT_SOURCE_FIELDS if default_fields else None
@@ -3598,7 +3931,7 @@ def export_sketch(
                             query_dsl=api_query_dsl,
                         )
                     else:
-                        print("    Note: No open indices to stream events from.")
+                        print(f"    [Sketch {sketch_id}] Note: No open indices to stream events from.")
                         data_handle = None
 
                     # Handle both string streams and DataFrames
@@ -3635,58 +3968,66 @@ def export_sketch(
 
         event_hash = event_hash_obj.hexdigest()
 
+        # Explicitly clear event objects from memory
+        if "data_handle" in locals():
+            del data_handle
+        gc.collect()
+
         # 5. Index Mappings
-        print("  Collecting index mappings...")
-        _export_index_mappings(datastore, active_indices, tmp_dir)
+        print(f"  [Sketch {sketch_id}] Collecting index mappings...")
+        _export_index_mappings(sketch_id, datastore, active_indices, tmp_dir)
 
         # 6. Stories as Markdown
-        print("  Exporting stories to Markdown...")
+        print(f"  [Sketch {sketch_id}] Exporting stories to Markdown...")
         _export_stories_to_markdown(sketch, tmp_dir)
 
         # 7. Verification
-        if actual_row_count != total_expected:
-            click.echo(
-                click.style(
-                    f"\nWARNING: Event count mismatch! Expected: {total_expected}, "
-                    f"Exported: {actual_row_count}",
-                    fg="red",
-                    bold=True,
-                ),
-                err=True,
-            )
-        else:
-            print(f"  Verification: {actual_row_count} events exported as expected.")
-
-        # 7.5 Spot Check Random Events
-        if actual_row_count > 0 and verification_query_dsl:
-            print("  Performing random spot check...")
-            sample_ids = _get_random_event_ids(
-                datastore, active_indices, verification_query_dsl, count=5
-            )
-            if sample_ids:
-                check_results = _spot_check_file(tmp_event_file, sample_ids)
-                success_count = sum(check_results.values())
-                if success_count == len(sample_ids):
-                    print(
-                        f"  SUCCESS: All {len(sample_ids)} sampled events "
-                        "found in export."
-                    )
-                else:
-                    click.echo(
-                        click.style(
-                            f"\nWARNING: Spot check failed! Only "
-                            f"{success_count}/{len(sample_ids)} sampled events "
-                            "were found in the exported file.",
-                            fg="red",
-                            bold=True,
-                        ),
-                        err=True,
-                    )
+        if not ignore_event_count:
+            if actual_row_count != total_expected:
+                click.echo(
+                    click.style(
+                        f"\n[Sketch {sketch_id}] WARNING: Event count mismatch! Expected: {total_expected}, "
+                        f"Exported: {actual_row_count}",
+                        fg="red",
+                        bold=True,
+                    ),
+                    err=True,
+                )
             else:
-                print("  WARNING: Could not retrieve sample events for spot check.")
+                print(f"  [Sketch {sketch_id}] Verification: {actual_row_count} events exported as expected.")
+
+            # 7.5 Spot Check Random Events
+            if actual_row_count > 0 and verification_query_dsl:
+                print(f"  [Sketch {sketch_id}] Performing random spot check...")
+                sample_ids = _get_random_event_ids(
+                    datastore, active_indices, verification_query_dsl, count=5
+                )
+                if sample_ids:
+                    check_results = _spot_check_file(tmp_event_file, sample_ids)
+                    success_count = sum(check_results.values())
+                    if success_count == len(sample_ids):
+                        print(
+                            f"  [Sketch {sketch_id}] SUCCESS: All {len(sample_ids)} sampled events "
+                            "found in export."
+                        )
+                    else:
+                        click.echo(
+                            click.style(
+                                f"\n[Sketch {sketch_id}] WARNING: Spot check failed! Only "
+                                f"{success_count}/{len(sample_ids)} sampled events "
+                                "were found in the exported file.",
+                                fg="red",
+                                bold=True,
+                            ),
+                            err=True,
+                        )
+                else:
+                    print(f"  [Sketch {sketch_id}] WARNING: Could not retrieve sample events for spot check.")
+        else:
+            print(f"  [Sketch {sketch_id}] Exported {actual_row_count} events (unverified).")
 
         # 8. Save Metadata and Bundle
-        print("  Finalizing manifest and hashing files...")
+        print(f"  [Sketch {sketch_id}] Finalizing manifest and hashing files...")
         with open(
             os.path.join(tmp_dir, DEFAULT_EXPORT_METADATA_FILENAME),
             "w",
@@ -3698,17 +4039,17 @@ def export_sketch(
             sketch, method, actual_row_count, event_filename, event_hash, tmp_dir
         )
 
-        print("  Creating compressed archive...")
+        print(f"  [Sketch {sketch_id}] Creating compressed archive...")
         _bundle_export_zip(tmp_dir, tmp_zip_path)
 
         # 10. Move to Destination
         # Using shutil.move instead of os.replace to handle cross-device
         # moves (e.g. from /tmp to a mounted volume).
         shutil.move(tmp_zip_path, filename)
-        print(f"Sketch exported successfully to {filename}")
+        print(f"[Sketch {sketch_id}] Sketch exported successfully to {filename}")
 
     except Exception as e:  # pylint: disable=broad-except
-        print(f"ERROR during export: {e}")
+        print(f"[Sketch {sketch_id}] ERROR during export: {e}")
         print(traceback.format_exc())
         sys.exit(1)
     finally:

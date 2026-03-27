@@ -315,7 +315,12 @@ def check_disk_space(path: str) -> int:
 
 
 def check_system_memory() -> int:
-    """Returns available system memory in GB from /proc/meminfo."""
+    """Returns available system memory in GB from /proc/meminfo.
+
+    Returns:
+        int: The amount of available memory in Gigabytes. Returns 999
+            on failure to allow the script to continue.
+    """
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
             for line in f:

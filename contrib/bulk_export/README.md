@@ -46,6 +46,7 @@ The script supports several command-line arguments:
 - `--export-dir`: Destination for ZIP files and logs (Default: `/usr/local/src/timesketch/exports`).
 - `--tmp-dir`: Temporary build directory (Default: `/tmp`).
 - `--min-disk-gb`: Hard stop threshold for free space (Default: 50).
+- `--min-ram-gb`: Pause processing if available system RAM falls below this threshold in GB (Default: 10).
 - `--settle-delay`: Wait time after closing indices (Default: 60).
 - `--include-deleted`: If set, sketches in the `deleted` state will also be exported.
 - `--all-statuses`: If set, sketches will be exported regardless of their current status.
