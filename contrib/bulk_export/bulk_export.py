@@ -556,8 +556,12 @@ def get_open_indices(datastore: OpenSearchDataStore) -> set[str]:
         A set of open index names.
     """
     try:
+        logger.info("Fetching index list from OpenSearch (this may take a moment)...")
+        # Use column filtering (h) to keep payload small, but avoid 's' (sort)
         res = datastore.client.cat.indices(format="json", h="index,status")
-        return {i["index"] for i in res if i["status"] == "open"}
+        open_indices = {i["index"] for i in res if i.get("status") == "open"}
+        logger.info("Found %d open indices.", len(open_indices))
+        return open_indices
     except Exception as e:
         logger.warning("Failed to get open indices list: %s", e)
         return set()
@@ -703,6 +707,9 @@ class ExportOrchestrator:
         self.lock = threading.Lock()
         self.producer_done = False
 
+        self.total_to_process = len(sketches)
+        self.processed_in_session = 0
+
         self.success_count = 0
         self.noop_count = 0
         self.total_bytes = 0
@@ -733,19 +740,13 @@ class ExportOrchestrator:
             while (not self.pending_queue.empty() or not self.instant_ready_queue.empty()) and not is_shutting_down:
                 
                 # 1. Exhaust instant_ready_queue first (fast path)
-                # This ensures already-open indices are exported before we put
-                # pressure on the Master node to open new ones.
+                # These are already open, so they don't count towards our 
+                # "opening budget". We feed them to the workers instantly.
                 while not self.instant_ready_queue.empty():
-                    if self.open_indices_count >= self.args.concurrency:
-                        time.sleep(2)
-                        continue
-                    
                     sketch_id = self.instant_ready_queue.get()
-                    logger.info("  Sketch %d (already open) -> READY", sketch_id)
+                    logger.info("  Sketch %d (ALREADY OPEN) -> READY", sketch_id)
                     self.ready_queue.put(sketch_id)
                     self.timings[sketch_id] = {"duration_open": 0.0}
-                    with self.lock:
-                        self.open_indices_count += 1
 
                 # 2. Check if we have anything else to do
                 if self.pending_queue.empty():
@@ -854,13 +855,14 @@ class ExportOrchestrator:
                     # Everything is done
                     break
 
-            # Heartbeat & Queue status
-            ready_count = self.ready_queue.qsize()
-            pending_count = self.pending_queue.qsize()
-            total_remaining = ready_count + pending_count
+            # Heartbeat & Session Progress
+            with self.lock:
+                self.processed_in_session += 1
+                current_count = self.processed_in_session
+
             logger.info(
-                "Worker picked up Sketch %d. Queue Status: %d ready, %d pending (%d total remaining).",
-                sketch_id, ready_count, pending_count, total_remaining
+                "Session Progress: [%d/%d] picked up Sketch %d.",
+                current_count, self.total_to_process, sketch_id
             )
             
             # Safety check: Don't export if the cluster is RED

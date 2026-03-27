@@ -8,8 +8,9 @@ A high-performance, resilient utility for exporting thousands of Timesketch sket
 - **Auto-Recovery**: Automatically handles cluster instability and Master node lag.
 - **Resource Guards**: Proactively monitors System RAM (OOM prevention) and OpenSearch JVM pressure.
 - **Fast Pathing**: Use `--open-indices-only` to export active data without Master node overhead.
+- **Hybrid Concurrency**: Dynamically allows parallel streaming for already-active sketches while serializing metadata changes for archived ones.
 - **Instant Shutdown**: Cleanly kills all child workers on `Ctrl+C` to prevent orphaned processes.
-- **Anti-Starvation**: Optimized producer loop ensures workers are never idle when ready sketches are available.
+- **Audit Trails**: Every export includes a detailed performance breakdown and SHA256 integrity verification.
 
 ## 📋 Prerequisites
 
@@ -25,16 +26,16 @@ Only export sketches that are already open in OpenSearch, skipping slow pre-coun
 python3 bulk_export.py \
   --export-dir /mnt/sketch_export/annotated \
   --pipeline \
-  --concurrency 1 \
+  --concurrency 2 \
   --open-indices-only \
   --ignore-event-count \
   --retry-failed \
   --min-ram-gb 25
 ```
-*(Note: You can safely increase `--concurrency` to 2 or more in this mode as it places zero pressure on the Master node.)*
+*(Note: You can safely increase `--concurrency` in this mode as it places zero pressure on the Master node.)*
 
 ### Full System Export
-Iterate through all sketches (including archived ones):
+Iterate through all sketches (including archived ones) with serialized opening:
 ```bash
 python3 bulk_export.py \
   --export-dir /mnt/sketch_export/all \
@@ -48,7 +49,7 @@ python3 bulk_export.py \
 
 ### Core Arguments
 - `--export-dir`: Destination for ZIP files and `manifest.csv`.
-- `--concurrency`: Number of parallel exports (Default: 1).
+- `--concurrency`: Number of parallel exports (Default: 1). **Recommended: 1-2 for high-shard clusters.**
 - `--pipeline`: Enable the producer/worker architecture (Highly recommended).
 - `--limit`: Stop after processing this many sketches.
 
@@ -67,10 +68,11 @@ python3 bulk_export.py \
 
 ## 📊 Monitoring
 
-### Checking Progress
-- **Success Rate**: `cat /path/to/export/manifest.csv | wc -l`
-- **Current Task**: `tail -f bulk_export.log`
-- **Performance**: Look for `PERF SUMMARY` in logs to see durations for Meta, Stream, and Zip phases.
+### Interactive Dashboard (Highly Recommended)
+Run the dedicated monitoring script to see cluster health, RAM usage, and live session progress in one view:
+```bash
+./monitor_export.sh
+```
 
 ### Troubleshooting
 - **Cluster turns RED**: The script will automatically pause. Check the Master node latency via:
