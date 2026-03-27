@@ -19,6 +19,7 @@ Key features:
 import argparse
 import click
 import csv
+import gc
 import hashlib
 import json
 import logging
@@ -185,7 +186,9 @@ def open_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool:
         for search_index in search_indexes:
             try:
                 logger.info(
-                    "  Opening OpenSearch index: %s", search_index.index_name
+                    "  [Sketch %d] Opening OpenSearch index: %s", 
+                    sketch_id, 
+                    search_index.index_name
                 )
                 datastore.client.indices.open(index=search_index.index_name)
                 # Mandatory cooldown after every single index command
@@ -194,7 +197,10 @@ def open_sketch_indices(sketch_id: int, datastore: OpenSearchDataStore) -> bool:
                 if "index_not_closed_exception" in str(e).lower():
                     continue
                 logger.error(
-                    "  Failed to open index %s: %s", search_index.index_name, e
+                    "  [Sketch %d] Failed to open index %s: %s", 
+                    sketch_id, 
+                    search_index.index_name, 
+                    e
                 )
                 return False
 
@@ -257,6 +263,7 @@ def run_tsctl(command: List[str]) -> Tuple[bool, str]:
     Returns:
         A tuple of (success_boolean, combined_output_string).
     """
+    global is_shutting_down
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     full_cmd = ["tsctl"] + command
@@ -269,14 +276,30 @@ def run_tsctl(command: List[str]) -> Tuple[bool, str]:
         text=True,
         env=env,
         bufsize=1,
+        start_new_session=True, # Allows us to kill the whole group
     )
 
-    if process.stdout:
-        for line in iter(process.stdout.readline, ""):
-            clean_line = line.strip()
-            if clean_line:
-                click.echo(f"      > {clean_line}")
-                combined_output.append(clean_line)
+    try:
+        if process.stdout:
+            for line in iter(process.stdout.readline, ""):
+                if is_shutting_down:
+                    logger.warning("Shutdown detected. Terminating child tsctl...")
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    break
+                
+                clean_line = line.strip()
+                if clean_line:
+                    click.echo(f"      > {clean_line}")
+                    combined_output.append(clean_line)
+    except Exception as e:
+        logger.error("Error reading tsctl output: %s", e)
+    finally:
+        if is_shutting_down and process.poll() is None:
+            # Final attempt to kill if still alive
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except Exception:
+                pass
 
     process.wait()
     return (process.returncode == 0), "\n".join(combined_output)
@@ -351,6 +374,24 @@ def check_jvm_pressure(datastore: OpenSearchDataStore, threshold: float) -> bool
         if stats["jvm"]["mem"]["heap_used_percent"] > (threshold * 100):
             return False
     return True
+
+
+def check_master_latency(datastore: OpenSearchDataStore, threshold_ms: int) -> Tuple[bool, int]:
+    """Checks the Master node task queue latency.
+
+    Args:
+        datastore: OpenSearch data store instance.
+        threshold_ms: Max allowed wait time in milliseconds.
+
+    Returns:
+        tuple: (bool indicating if healthy, actual latency in ms).
+    """
+    try:
+        health = datastore.client.cluster.health(request_timeout=10)
+        latency = health.get("task_max_waiting_in_queue_millis", 0)
+        return (latency < threshold_ms), latency
+    except Exception:
+        return False, 999999
 
 
 def get_processed_ids(manifest_path: str) -> set[int]:
@@ -688,8 +729,14 @@ class ExportOrchestrator:
         global is_shutting_down
         while (not self.pending_queue.empty() or not self.instant_ready_queue.empty()) and not is_shutting_down:
             
-            # 1. Feed from instant_ready_queue first (fast path)
-            while not self.instant_ready_queue.empty() and self.open_indices_count < self.args.concurrency:
+            # 1. Exhaust instant_ready_queue first (fast path)
+            # This ensures already-open indices are exported before we put
+            # pressure on the Master node to open new ones.
+            while not self.instant_ready_queue.empty():
+                if self.open_indices_count >= self.args.concurrency:
+                    time.sleep(2)
+                    continue
+                
                 sketch_id = self.instant_ready_queue.get()
                 logger.info("  Sketch %d (already open) -> READY", sketch_id)
                 self.ready_queue.put(sketch_id)
@@ -697,17 +744,19 @@ class ExportOrchestrator:
                 with self.lock:
                     self.open_indices_count += 1
 
+            # 2. Check if we have anything else to do
             if self.pending_queue.empty():
-                if not self.instant_ready_queue.empty():
-                    time.sleep(10)
-                    continue
-                else:
-                    break
+                break
 
-            # Stricter buffer: only open indices for current concurrency
-            # to prevent metadata piling on the Master node.
-            if self.open_indices_count >= self.args.concurrency:
-                time.sleep(10)
+            # 3. Buffer control for Pending (Archived) sketches
+            # Only block if the ready_queue is sufficiently full to prevent worker starvation.
+            if self.ready_queue.qsize() >= (self.args.concurrency * 2):
+                time.sleep(5)
+                continue
+            
+            # If we are strictly opening archived ones, respect the concurrency limit
+            if self.open_indices_count >= self.args.concurrency and not self.args.open_indices_only:
+                time.sleep(5)
                 continue
 
             # Resource Guards
@@ -730,6 +779,15 @@ class ExportOrchestrator:
                 if not check_jvm_pressure(self.datastore, self.args.jvm_threshold):
                     logger.warning("JVM pressure high. Waiting...")
                     time.sleep(60)
+                    continue
+                
+                is_ok, latency = check_master_latency(self.datastore, self.args.max_master_wait)
+                if not is_ok:
+                    logger.warning(
+                        "Master node queue latency high (%d ms). Waiting...", 
+                        latency
+                    )
+                    time.sleep(30)
                     continue
 
                 safe, _, _ = check_shard_limit(
@@ -852,6 +910,9 @@ class ExportOrchestrator:
                 )
 
             self.cleanup_queue.put(sketch_id)
+            
+            # Prevent memory creep in long-running threads
+            gc.collect()
 
     def cleaner_thread(self):
         """Sequentially closes indices."""
@@ -869,6 +930,20 @@ class ExportOrchestrator:
             sketch = Sketch.query.get(sketch_id)
             status_obj = sketch.get_status
             orig_status = status_obj.status if status_obj else "unknown"
+
+            # Master Latency Guard: Pause if Master is struggling with metadata
+            if not self.args.ignore_cluster_checks:
+                while True:
+                    is_ok, latency = check_master_latency(
+                        self.datastore, self.args.max_master_wait
+                    )
+                    if is_ok:
+                        break
+                    logger.warning(
+                        "Master node queue latency high (%d ms). Cleaner pausing...", 
+                        latency
+                    )
+                    time.sleep(30)
 
             start_close = time.time()
             if orig_status != "ready":
@@ -925,6 +1000,10 @@ def run_export() -> None:
         "--min-ram-gb", type=int, default=10, help="Pause if available RAM is below this GB"
     )
     parser.add_argument(
+        "--max-master-wait", type=int, default=10000, 
+        help="Pause if Master node queue wait time exceeds this ms (Default: 10000)"
+    )
+    parser.add_argument(
         "--settle-delay", type=int, default=SETTLE_DELAY
     )
     parser.add_argument("--include-deleted", action="store_true")
@@ -950,6 +1029,11 @@ def run_export() -> None:
     parser.add_argument("--ignore-cluster-checks", action="store_true")
     parser.add_argument("--ignore-index-wait", action="store_true")
     parser.add_argument("--ignore-event-count", action="store_true")
+    parser.add_argument(
+        "--open-indices-only",
+        action="store_true",
+        help="Only export sketches that already have all indices open in OpenSearch.",
+    )
     parser.add_argument("--log-file")
     args = parser.parse_args()
 
@@ -974,6 +1058,19 @@ def run_export() -> None:
     else: q = q.order_by(Sketch.id.desc())
     
     to_process = [s for s in q.all() if s.id not in processed_ids]
+    
+    # Fast path: Only process sketches already open in OpenSearch
+    if args.open_indices_only:
+        logger.info("Filtering for sketches with ALREADY OPEN indices...")
+        open_os_indices = get_open_indices(datastore)
+        filtered_process = []
+        for s in to_process:
+            indices = {t.searchindex.index_name for t in s.timelines if t.searchindex}
+            if indices and indices.issubset(open_os_indices):
+                filtered_process.append(s)
+        to_process = filtered_process
+        logger.info("Filtered down to %d sketches.", len(to_process))
+
     if args.limit: to_process = to_process[:args.limit]
 
     logger.info("Targeting %d sketches. Pipeline: %s", len(to_process), args.pipeline)
