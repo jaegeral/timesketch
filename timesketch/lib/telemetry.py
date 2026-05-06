@@ -33,7 +33,11 @@ try:
     from opentelemetry.instrumentation.flask import FlaskInstrumentor
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider, SpanProcessor, StatusCode
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor,
+        ConsoleSpanExporter,
+        SimpleSpanProcessor,
+    )
 
     HAS_OTEL = True
 
@@ -209,6 +213,8 @@ def setup_telemetry(service_name: str):
         - 'otlp-http': Exports to an OTLP collector via HTTP.
           Uses `TIMESKETCH_OTLP_HTTP_ENDPOINT`
           (default: http://localhost:4318/v1/traces).
+        - 'otlp-console': Prints spans directly to stdout (useful for local
+          debugging and zero-infrastructure E2E testing).
 
     Args:
         service_name (str): The name of the service to identify traces in the backend.
@@ -231,6 +237,7 @@ def setup_telemetry(service_name: str):
 
     otel_mode = os.environ.get("TIMESKETCH_OTEL_MODE", "").lower()
     trace_exporter = None
+    use_batch_processor = True
 
     if otel_mode == "otlp-grpc":
         endpoint = os.environ.get("TIMESKETCH_OTLP_GRPC_ENDPOINT", "localhost:4317")
@@ -253,11 +260,14 @@ def setup_telemetry(service_name: str):
             resource_regex=r"service.*",
             client=trace_client,
         )
+    elif otel_mode == "otlp-console":
+        trace_exporter = ConsoleSpanExporter()
+        use_batch_processor = False
     else:
         logger.error(
             "Unsupported OTEL tracing mode %s. "
             "Valid values for TIMESKETCH_OTEL_MODE are: "
-            "'otlp-grpc', 'otlp-http', 'otlp-default-gce'",
+            "'otlp-grpc', 'otlp-http', 'otlp-default-gce', 'otlp-console'",
             otel_mode,
         )
         return
@@ -266,7 +276,12 @@ def setup_telemetry(service_name: str):
     _TRACER_PROVIDER = TracerProvider(resource=resource)
     # Add the scrubber first to ensure it processes spans before they are batched
     _TRACER_PROVIDER.add_span_processor(SensitiveDataScrubber())
-    _TRACER_PROVIDER.add_span_processor(BatchSpanProcessor(trace_exporter))
+
+    if use_batch_processor:
+        _TRACER_PROVIDER.add_span_processor(BatchSpanProcessor(trace_exporter))
+    else:
+        _TRACER_PROVIDER.add_span_processor(SimpleSpanProcessor(trace_exporter))
+
     trace.set_tracer_provider(_TRACER_PROVIDER)
 
     # Ensure traces are flushed on shutdown
