@@ -30,19 +30,17 @@ class TelemetryTest(interface.BaseEndToEndTest):
         otel_mode = os.environ.get("TIMESKETCH_OTEL_MODE", "").lower()
         
         # Trigger activity
-        self.api.get_sketches()
+        self.api.list_sketches()
         time.sleep(2)
 
         # Check logs
         try:
             # We look at the logs of the current container
-            # In E2E tests, we are usually running INSIDE the timesketch container
-            # but we need to check the web server logs.
             result = subprocess.run(
                 ['sudo', 'docker', 'logs', 'timesketch-dev', '--tail', '100'],
                 capture_output=True,
                 text=True,
-                check=False # Don't crash if docker isn't accessible this way
+                check=False
             )
             logs = result.stdout + result.stderr
             
@@ -60,8 +58,37 @@ class TelemetryTest(interface.BaseEndToEndTest):
                 )
 
         except Exception: # pylint: disable=broad-except
-            # If we can't check docker logs (e.g. CI environment), we at least
-            # verify that the API call didn't crash.
             pass
+
+    def test_verify_stability(self):
+        """Verifies that the system DOES NOT crash when OTel is missing.
+
+        This test proves the stability of the fix by simulating
+        a missing opentelemetry library and asserting that it remains
+        stable using the Ghost Tracer pattern.
+        """
+        import importlib
+        from unittest.mock import patch
+        from timesketch.lib import telemetry
+
+        real_import = __import__
+
+        def mock_import(name, *args, **kwargs):
+            if "opentelemetry" in name:
+                raise ImportError("Simulated missing lib")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            # Reload telemetry to trigger the HAS_OTEL=False path
+            importlib.reload(telemetry)
+            
+            # This should NOT crash (Proves Ghost Tracer is working)
+            tracer = telemetry.get_tracer("test")
+            with tracer.start_as_current_span("test-span"):
+                pass
+            
+            # This should be False if OTel was correctly blocked
+            self.assertions.assertFalse(telemetry.HAS_OTEL)
+
 
 manager.EndToEndTestManager.register_test(TelemetryTest)
