@@ -90,9 +90,9 @@ def create_app(
     )
 
     if not config:
-        if "pytest" in sys.modules or "unittest" in sys.modules:
+        if "pytest" in sys.modules:
             # pylint: disable=import-outside-toplevel
-            from timesketch.test_config import TestConfig
+            from timesketch.lib.testlib import TestConfig
 
             config = TestConfig
         else:
