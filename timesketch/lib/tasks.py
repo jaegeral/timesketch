@@ -924,19 +924,13 @@ def run_plaso(
             raise RuntimeError(f"Unable to open Plaso storage reader for {file_path}")
 
         try:
-            total_events = storage_reader.GetNumberOfAttributeContainers("event")
-            if total_events:
-                total_file_events = total_events
-            else:
-                total_file_events = storage_reader.GetNumberOfAttributeContainers(
-                    "event_data"
-                )
+            total_file_events = storage_reader.GetNumberOfAttributeContainers("event")
         finally:
             storage_reader.Close()
 
         if total_file_events is None:
             raise RuntimeError(
-                f"Unable to read event or event_data containers from {file_path}"
+                f"Unable to read event containers from {file_path}"
             )
         logger.info(
             "Finished reading event count (%d) from %s", total_file_events, file_path
