@@ -90,14 +90,20 @@ def create_app(
     )
 
     if not config:
-        # Where to find the config file
-        default_path = "/etc/timesketch/timesketch.conf"
-        # Fall back to legacy location of the config file
-        legacy_path = "/etc/timesketch.conf"
-        if os.path.isfile(default_path):
-            config = default_path
+        if "pytest" in sys.modules or "unittest" in sys.modules:
+            # pylint: disable=import-outside-toplevel
+            from timesketch.test_config import TestConfig
+
+            config = TestConfig
         else:
-            config = legacy_path
+            # Where to find the config file
+            default_path = "/etc/timesketch/timesketch.conf"
+            # Fall back to legacy location of the config file
+            legacy_path = "/etc/timesketch.conf"
+            if os.path.isfile(default_path):
+                config = default_path
+            else:
+                config = legacy_path
 
     if isinstance(config, str):
         os.environ["TIMESKETCH_SETTINGS"] = config

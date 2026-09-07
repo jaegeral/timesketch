@@ -15,21 +15,10 @@
 
 from unittest import mock
 
-from timesketch.app import create_app as _create_app
-from timesketch.lib.testlib import BaseTest, TestConfig
+from timesketch.lib import tasks
+from timesketch.lib.testlib import BaseTest
 from timesketch.models import db_session
 from timesketch.models.sketch import DataSource, SearchIndex
-
-# When tasks.py is imported, it executes celery = create_celery_app(), which calls
-# create_app() with no arguments. Without a config argument, create_app() loads
-# /etc/timesketch/timesketch.conf (PostgreSQL) and clobbers the in-memory SQLite
-# engine used by BaseTest. We temporarily provide TestConfig during the import of
-# tasks to ensure Celery and tasks initialize against SQLite for the test suite.
-with mock.patch(
-    "timesketch.app.create_app",
-    side_effect=lambda config=None: _create_app(config or TestConfig),
-):
-    from timesketch.lib import tasks
 
 
 class TestTasks(BaseTest):
@@ -470,6 +459,9 @@ class TestTasks(BaseTest):
                     source_type="plaso",
                     timeline_id=self.timeline.id,
                 )
-            self.assertIn("Unable to read event or event_data containers", str(context.exception))
+            self.assertIn(
+                "Unable to read event or event_data containers",
+                str(context.exception),
+            )
             self.assertEqual(datasource.status[0].status, "fail")
             mock_storage_reader.Close.assert_called_once()
