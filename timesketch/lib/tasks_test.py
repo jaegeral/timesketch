@@ -134,6 +134,7 @@ class TestTasks(BaseTest):
                     timeline_id=self.timeline.id,
                 )
             self.assertIn("Plaso version could not be parsed", str(context.exception))
+            self.assertIn("error: invalid literal for int()", str(context.exception))
 
     def test_run_plaso_with_events_raises(self):
         """Test run_plaso raises RuntimeError when events string is provided."""

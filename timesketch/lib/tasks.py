@@ -880,11 +880,11 @@ def run_plaso(
                     f"{plaso_version:d}, please upgrade to a version that is "
                     f"{PLASO_MINIMUM_VERSION:d} or later)"
                 )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
             error_message = (
                 f"Plaso version could not be parsed (installed version: "
-                f"{getattr(plaso, '__version__', 'unknown')}), please ensure it is "
-                f"{PLASO_MINIMUM_VERSION:d} or later."
+                f"{getattr(plaso, '__version__', 'unknown')}, error: {e}), please "
+                f"ensure it is {PLASO_MINIMUM_VERSION:d} or later"
             )
 
     if error_message:
