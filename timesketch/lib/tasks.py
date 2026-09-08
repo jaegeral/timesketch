@@ -929,9 +929,7 @@ def run_plaso(
             storage_reader.Close()
 
         if total_file_events is None:
-            raise RuntimeError(
-                f"Unable to read event containers from {file_path}"
-            )
+            raise RuntimeError(f"Unable to read event containers from {file_path}")
         logger.info(
             "Finished reading event count (%d) from %s", total_file_events, file_path
         )
