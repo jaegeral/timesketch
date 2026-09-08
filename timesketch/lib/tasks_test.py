@@ -15,8 +15,8 @@
 
 from unittest import mock
 
-from timesketch.lib import tasks
 from timesketch.lib.testlib import BaseTest
+from timesketch.lib import tasks
 from timesketch.models import db_session
 from timesketch.models.sketch import DataSource, SearchIndex
 
