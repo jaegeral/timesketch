@@ -90,11 +90,8 @@ def create_app(
     )
 
     if not config:
-        if "pytest" in sys.modules:
-            # pylint: disable=import-outside-toplevel
-            from timesketch.lib.testlib import TestConfig
-
-            config = TestConfig
+        if "TIMESKETCH_SETTINGS" in os.environ:
+            config = os.environ["TIMESKETCH_SETTINGS"]
         else:
             # Where to find the config file
             default_path = "/etc/timesketch/timesketch.conf"
@@ -106,16 +103,29 @@ def create_app(
                 config = legacy_path
 
     if isinstance(config, str):
-        os.environ["TIMESKETCH_SETTINGS"] = config
-        try:
-            app.config.from_envvar("TIMESKETCH_SETTINGS")
+        if os.path.isfile(config):
+            os.environ["TIMESKETCH_SETTINGS"] = config
+            try:
+                app.config.from_envvar("TIMESKETCH_SETTINGS")
 
-            if "EMAIL_USER_WHITELIST" in app.config:
+                if "EMAIL_USER_WHITELIST" in app.config:
+                    sys.stderr.write(
+                        "Warning, EMAIL_USER_WHITELIST has been deprecated. "
+                        "Please update timesketch.conf."
+                    )
+            except OSError:
+                sys.stderr.write(f"Config file {config} does not exist.\n")
+                sys.exit()
+        elif "." in config and "/" not in config:
+            # Supports dotted Python module/class path (e.g. TestConfig)
+            try:
+                app.config.from_object(config)
+            except (ImportError, AttributeError, ValueError):
                 sys.stderr.write(
-                    "Warning, EMAIL_USER_WHITELIST has been deprecated. "
-                    "Please update timesketch.conf."
+                    f"Configuration module {config} could not be loaded.\n"
                 )
-        except OSError:
+                sys.exit()
+        else:
             sys.stderr.write(f"Config file {config} does not exist.\n")
             sys.exit()
     else:
