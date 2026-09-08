@@ -120,9 +120,9 @@ def create_app(
             # Supports dotted Python module/class path (e.g. TestConfig)
             try:
                 app.config.from_object(config)
-            except (ImportError, AttributeError, ValueError):
+            except (ImportError, AttributeError, ValueError) as e:
                 sys.stderr.write(
-                    f"Configuration module {config} could not be loaded.\n"
+                    f"Configuration module {config} could not be loaded: {e}\n"
                 )
                 sys.exit()
         else:
