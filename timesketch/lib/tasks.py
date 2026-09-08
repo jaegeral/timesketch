@@ -833,7 +833,7 @@ def run_plaso(
     source_type: str,
     timeline_id: int,
     plaso_event_filter: str = "",
-):
+) -> Optional[str]:
     """Create a Celery task for processing Plaso storage file.
 
     Args:
@@ -843,16 +843,16 @@ def run_plaso(
         index_name: Name of the datastore index.
         source_type: Type of file, csv or jsonl.
         timeline_id: ID of the timeline object this data belongs to.
-        plaso_event_filter: filter string for Plaso files.
+        plaso_event_filter: Filter string for Plaso files.
 
     Raises:
         RuntimeError: If the function is called using events, plaso
             is not installed or is of unsupported version.
-        DataIngestionError: If the searchidnex can't be created.
-        ImportError: If the searchidnex can't be created.
-        NameError: If the searchidnex can't be created.
-        UnboundLocalError: If the searchidnex can't be created.
-        RequestError: If the searchidnex can't be created.
+        DataIngestionError: If the searchindex can't be created.
+        ImportError: If the searchindex can't be created.
+        NameError: If the searchindex can't be created.
+        UnboundLocalError: If the searchindex can't be created.
+        RequestError: If the searchindex can't be created.
         IndexNotReadyError: If the searchindex isn't ready.
         DatastoreConnectionError: If the opensearch connection isn't available.
         subprocess.CalledProcessError: If the psort command fails.
