@@ -116,6 +116,15 @@ def create_app(
             except OSError:
                 sys.stderr.write(f"Config file {config} does not exist.\n")
                 sys.exit()
+        elif "." in config and "/" not in config:
+            # Supports dotted Python module/class path (e.g. TestConfig)
+            try:
+                app.config.from_object(config)
+            except (ImportError, AttributeError, ValueError):
+                sys.stderr.write(
+                    f"Configuration module {config} could not be loaded.\n"
+                )
+                sys.exit()
         else:
             sys.stderr.write(f"Config file {config} does not exist.\n")
             sys.exit()
