@@ -20,6 +20,7 @@ import pandas as pd
 
 from click.testing import CliRunner
 
+from timesketch_api_client import sketch as api_sketch
 from timesketch_api_client import test_lib as api_test_lib
 
 from timesketch_cli_client import test_lib
@@ -323,3 +324,85 @@ class SketchTest(unittest.TestCase):
                 result.output,
             )
             self.assertFalse(os.path.exists("output.csv"))
+
+    def test_archive_sketch_success(self):
+        """Test archiving an active sketch succeeds without calling can_archive."""
+        runner = CliRunner()
+        with mock.patch.object(
+            api_sketch.Sketch, "is_archived", return_value=False
+        ), mock.patch.object(
+            api_sketch.Sketch, "archive", return_value=True
+        ) as mock_archive:
+            result = runner.invoke(sketch_group, ["archive"], obj=self.ctx)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Sketch archived", result.output)
+        mock_archive.assert_called_once_with()
+
+    def test_archive_sketch_already_archived(self):
+        """Test archiving an already-archived sketch exits with status 1."""
+        runner = CliRunner()
+        with mock.patch.object(
+            api_sketch.Sketch, "is_archived", return_value=True
+        ), mock.patch.object(api_sketch.Sketch, "archive") as mock_archive:
+            result = runner.invoke(sketch_group, ["archive"], obj=self.ctx)
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Error: Sketch is already archived.", result.output)
+        mock_archive.assert_not_called()
+
+    def test_archive_sketch_failure(self):
+        """Test archiving failure (e.g. HTTP 403) prints error and exits 1."""
+        runner = CliRunner()
+        with mock.patch.object(
+            api_sketch.Sketch, "is_archived", return_value=False
+        ), mock.patch.object(
+            api_sketch.Sketch, "archive", return_value=False
+        ) as mock_archive:
+            result = runner.invoke(sketch_group, ["archive"], obj=self.ctx)
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Error: Failed to archive sketch.", result.output)
+        self.assertNotIn("Sketch archived", result.output)
+        mock_archive.assert_called_once_with()
+
+    def test_unarchive_sketch_success(self):
+        """Test unarchiving an archived sketch succeeds."""
+        runner = CliRunner()
+        with mock.patch.object(
+            api_sketch.Sketch, "is_archived", return_value=True
+        ), mock.patch.object(
+            api_sketch.Sketch, "unarchive", return_value=True
+        ) as mock_unarchive:
+            result = runner.invoke(sketch_group, ["unarchive"], obj=self.ctx)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Sketch unarchived", result.output)
+        mock_unarchive.assert_called_once_with()
+
+    def test_unarchive_sketch_not_archived(self):
+        """Test unarchiving an active sketch exits with status 1."""
+        runner = CliRunner()
+        with mock.patch.object(
+            api_sketch.Sketch, "is_archived", return_value=False
+        ), mock.patch.object(api_sketch.Sketch, "unarchive") as mock_unarchive:
+            result = runner.invoke(sketch_group, ["unarchive"], obj=self.ctx)
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Error: Sketch is not archived.", result.output)
+        mock_unarchive.assert_not_called()
+
+    def test_unarchive_sketch_failure(self):
+        """Test unarchiving failure (e.g. HTTP 403) prints error and exits 1."""
+        runner = CliRunner()
+        with mock.patch.object(
+            api_sketch.Sketch, "is_archived", return_value=True
+        ), mock.patch.object(
+            api_sketch.Sketch, "unarchive", return_value=False
+        ) as mock_unarchive:
+            result = runner.invoke(sketch_group, ["unarchive"], obj=self.ctx)
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Error: Failed to unarchive sketch.", result.output)
+        self.assertNotIn("Sketch unarchived", result.output)
+        mock_unarchive.assert_called_once_with()

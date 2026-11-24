@@ -212,25 +212,21 @@ def archive_sketch(ctx: click.Context) -> None:
     modifications.
 
     Raises:
-        click.exceptions.Exit: If the sketch is already archived or the user
-        lacks permissions to archive it.
+        click.exceptions.Exit: If the sketch is already archived or archiving fails.
 
     Outputs:
         Text: A message indicating whether the sketch was successfully archived.
-        Error message: If the sketch is already archived or the user lacks permissions.
+        Error message: If the sketch is already archived or archiving fails.
     """
     sketch = ctx.obj.sketch
-    # if sketch is already archived error
     if sketch.is_archived():
-        click.echo("Error Sketch is already archived")
+        click.echo("Error: Sketch is already archived.")
         ctx.exit(1)
 
-    # check if user has permissions
-    if not sketch.can_archive():
-        click.echo("User can not archive this sketch")
+    if not sketch.archive():
+        click.echo("Error: Failed to archive sketch.")
         ctx.exit(1)
 
-    sketch.archive()
     click.echo("Sketch archived")
 
 
@@ -242,20 +238,22 @@ def unarchive_sketch(ctx: click.Context) -> None:
     Unarchives a previously archived sketch, allowing modifications to be made again.
 
     Raises:
-        click.exceptions.Exit: If the sketch is not archived.
+        click.exceptions.Exit: If the sketch is not archived or unarchiving fails.
 
     Outputs:
         Text: A message indicating whether the sketch was successfully unarchived.
-        Error message: If the sketch is not archived.
+        Error message: If the sketch is not archived or unarchiving fails.
     """
     sketch = ctx.obj.sketch
-    # if sketch is not archived error
     if not sketch.is_archived():
-        click.echo("Error Sketch is not archived")
+        click.echo("Error: Sketch is not archived.")
         ctx.exit(1)
-    if sketch.is_archived():
-        sketch.unarchive()
-        click.echo("Sketch unarchived")
+
+    if not sketch.unarchive():
+        click.echo("Error: Failed to unarchive sketch.")
+        ctx.exit(1)
+
+    click.echo("Sketch unarchived")
 
 
 @sketch_group.command("add_label", help="Add a label to a sketch")
